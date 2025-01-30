@@ -1,0 +1,53 @@
+general:
+  confirm_operations: true
+  plex_only: false
+  limit_plex_results: 3
+  limit_trakt_results: 3
+  exclude_genre: animation, documentary,
+  show_summary: true
+  show_cast: true
+  show_creator: true
+  show_language: true
+  show_imdb_link: true
+  keep_logs: 10
+
+paths:
+  path_mappings: null
+  platform: windows
+
+plex:
+  url: http://localhost:32400
+  token: YOUR_PLEX_TOKEN
+  TV_library_title: TV Shows
+  add_label: true
+  label_name: RecommendedShows
+  remove_previous_recommendations: true
+
+sonarr:
+  url: http://localhost:8989
+  api_key: YOUR_SONARR_API_KEY
+  root_folder: P:\TV
+  add_to_sonarr: true
+  monitor: true
+  monitor_option: firstseason #all, none or firstseason
+  search_missing: true
+  quality_profile: HD-1080p
+  sonarr_tag: RecommendForPlex
+
+
+trakt:
+  access_token: 
+  client_id: 
+  client_secret: 
+  sync_watch_history: false
+ 
+TMDB:
+  use_TMDB_keywords: true
+  api_key: YOUR_TMDB_API_KEY
+
+weights: #Make sure the total equals 1
+  genre_weight: 0.25
+  keyword_weight: 0.25
+  creator_weight: 0.20
+  actor_weight: 0.20
+  language_weight: 0.10
