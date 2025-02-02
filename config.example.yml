@@ -6,8 +6,8 @@ general:
   exclude_genre: animation, documentary,
   show_summary: true
   show_cast: true
-  show_creator: true
   show_language: true
+  show_imdb_rating: true
   show_imdb_link: true
   keep_logs: 10
 
@@ -29,7 +29,7 @@ sonarr:
   root_folder: P:\TV
   add_to_sonarr: true
   monitor: true
-  monitor_option: firstseason #all, none or firstseason
+  monitor_option: none #all, none or firstSeason
   search_missing: true
   quality_profile: HD-1080p
   sonarr_tag: RecommendForPlex
@@ -37,17 +37,17 @@ sonarr:
 
 trakt:
   access_token: 
-  client_id: 
-  client_secret: 
-  sync_watch_history: false
+  client_id: YOUR_TRAKT_CLIENT_ID
+  client_secret: YOUR_TRAKT_CLIENT_SECRET
+  sync_watch_history: true
  
 TMDB:
-  use_TMDB_keywords: true
   api_key: YOUR_TMDB_API_KEY
+  use_TMDB_keywords: true
 
 weights: #Make sure the total equals 1
   genre_weight: 0.25
   keyword_weight: 0.25
-  creator_weight: 0.20
+  studio_weight: 0.20
   actor_weight: 0.20
   language_weight: 0.10
