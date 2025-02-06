@@ -14,7 +14,7 @@ from urllib.parse import quote
 import re
 from datetime import datetime, timedelta
 
-__version__ = "0.9"
+__version__ = "1.0"
 REPO_URL = "https://github.com/netplexflix/TV-Show-Recommendations-for-Plex"
 API_VERSION_URL = f"https://api.github.com/repos/netplexflix/TV-Show-Recommendations-for-Plex/releases/latest"
 
@@ -105,7 +105,7 @@ class PlexTVRecommender:
         print("Initializing recommendation system...")
         self.config = self._load_config(config_path)
         
-        # Load TMDB config early
+        # Load TMDB config
         tmdb_config = self.config.get('TMDB', {})
         self.use_tmdb_keywords = tmdb_config.get('use_TMDB_keywords', False)
         self.tmdb_api_key = tmdb_config.get('api_key', None)
@@ -126,7 +126,7 @@ class PlexTVRecommender:
         self.show_studio = general_config.get('show_studio', False)
         self.show_language = general_config.get('show_language', False)
         self.show_imdb_link = general_config.get('show_imdb_link', False)
-        self.show_imdb_rating = general_config.get('show_imdb_rating', False)
+        self.show_rating = general_config.get('show_rating', False)
         
         # Set up excluded genres
         exclude_genre_str = general_config.get('exclude_genre', '')
@@ -300,7 +300,6 @@ class PlexTVRecommender:
     # CACHING LOGIC
     # ------------------------------------------------------------------------
     def _load_trakt_sync_cache(self) -> Set[int]:
-        """Load previously synced show IDs"""
         if not os.path.exists(self.trakt_sync_cache_path):
             return set()
         try:
@@ -314,8 +313,8 @@ class PlexTVRecommender:
 			
     def _save_watched_cache(self):
         data = {
-            'watched_count': self.cached_watched_count,  # Now stores show count
-            'watched_show_ids': list(self._get_watched_show_ids()),  # Store show IDs
+            'watched_count': self.cached_watched_count,
+            'watched_show_ids': list(self._get_watched_show_ids()),
             'watched_data_counters': self.watched_data_counters,
             'plex_tmdb_cache': self.plex_tmdb_cache,
             'tmdb_keywords_cache': self.tmdb_keywords_cache
@@ -339,7 +338,6 @@ class PlexTVRecommender:
             print(f"{YELLOW}Error saving unwatched cache: {e}{RESET}")
 
     def _save_trakt_sync_cache(self):
-        """Save synced show IDs to cache using class attribute"""
         try:
             with open(self.trakt_sync_cache_path, 'w', encoding='utf-8') as f:
                 json.dump({
@@ -470,7 +468,6 @@ class PlexTVRecommender:
                 
                 results = resp.json().get('results', [])
                 if results:
-                    # Find exact match considering year
                     exact_match = next(
                         (r for r in results 
                          if r.get('name', '').lower() == show_title.lower()
@@ -485,7 +482,7 @@ class PlexTVRecommender:
     
         # Method 3: Single Fallback Attempt via IMDb
         if not tmdb_id and not hasattr(plex_show, '_tmdb_fallback_attempted'):
-            plex_show._tmdb_fallback_attempted = True  # Prevent recursion
+            plex_show._tmdb_fallback_attempted = True
             tmdb_id = self._get_tmdb_id_via_imdb(plex_show)
     
         # Update cache even if None to prevent repeat lookups
@@ -549,19 +546,15 @@ class PlexTVRecommender:
             episode = episodes[0]
             episode.reload()
             
-            # Check media
             if not episode.media:
                 return "N/A"
                 
             for media in episode.media:
                 for part in media.parts:
-                    # Use audioStreams() method
                     audio_streams = part.audioStreams()
                     
                     if audio_streams:
-                        # Get primary audio stream
                         audio = audio_streams[0]                     
-                        # Try different language attributes
                         lang_code = (
                             getattr(audio, 'languageTag', None) or
                             getattr(audio, 'language', None)
@@ -576,7 +569,6 @@ class PlexTVRecommender:
         return "N/A"
 
     def _extract_genres(self, show) -> List[str]:
-        """Safely extract genres from show"""
         genres = []
         try:
             if not hasattr(show, 'genres') or not show.genres:
@@ -672,7 +664,6 @@ class PlexTVRecommender:
     # TRAKT SYNC: BATCHED
     # ------------------------------------------------------------------------
     def _sync_plex_watched_to_trakt(self):
-        """Sync watched shows to Trakt in chunks"""
         if not self.sync_watch_history:
             return
     
@@ -695,7 +686,7 @@ class PlexTVRecommender:
         for chunk_start in range(0, total_shows, chunk_size):
             chunk_end = min(chunk_start + chunk_size, total_shows)
             chunk = shows_to_sync[chunk_start:chunk_end]
-            chunk_payload = {"episodes": []}  # Correct root level key
+            chunk_payload = {"episodes": []}
             chunk_successful_ids = set()
             
             print(f"\nProcessing chunk {chunk_start + 1} to {chunk_end} of {total_shows}")
@@ -717,7 +708,6 @@ class PlexTVRecommender:
                     if not last_watched:
                         continue
     
-                    # Get show identifiers
                     imdb_id = None
                     tvdb_id = None
                     if hasattr(show, 'guids'):
@@ -727,7 +717,6 @@ class PlexTVRecommender:
                             elif 'tvdb://' in guid.id:
                                 tvdb_id = guid.id.replace('tvdb://', '')
     
-                    # Format episode data for Trakt
                     episode_data = {
                         "watched_at": last_watched.strftime("%Y-%m-%dT%H:%M:%SZ"),
                         "ids": {
@@ -767,7 +756,6 @@ class PlexTVRecommender:
         print(f"\n{GREEN}Sync complete. {synced_in_session} shows synced to Trakt.{RESET}")
 
     def calculate_show_score(self, show) -> float:
-        """Calculate recommendation score based on watched history"""
         try:
             user_genres = Counter(self.watched_data.get('genres', {}))
             user_studio = Counter(self.watched_data.get('studio', {}))
@@ -853,36 +841,31 @@ class PlexTVRecommender:
         try:
             show.reload()
             
-            # Get IMDb ID and rating
             imdb_id = None
-            imdb_rating = 0
+            audience_rating = 0
             tmdb_keywords = []
             
-            # Get IMDb ID
             if hasattr(show, 'guids'):
                 for guid in show.guids:
                     if 'imdb://' in guid.id:
                         imdb_id = guid.id.replace('imdb://', '')
                         break
             
-            # Get IMDb rating
-            if self.show_imdb_rating and hasattr(show, 'ratings'):
+            if self.show_rating and hasattr(show, 'ratings'):
                 for rating in show.ratings:
                     if (getattr(rating, 'image', '') == 'imdb://image.rating' and 
                         getattr(rating, 'type', '') == 'audience'):
                         try:
-                            imdb_rating = float(rating.value)
+                            audience_rating = float(rating.value)
                             break
                         except (ValueError, AttributeError):
                             pass
                             
-            # Get TMDB keywords if enabled
             if self.use_tmdb_keywords and self.tmdb_api_key:
                 tmdb_id = self._get_plex_show_tmdb_id(show)
                 if tmdb_id:
                     tmdb_keywords = list(self._get_tmdb_keywords_for_id(tmdb_id))
             
-            # Build show info dictionary
             show_info = {
                 'title': show.title,
                 'year': getattr(show, 'year', None),
@@ -892,13 +875,12 @@ class PlexTVRecommender:
                 'language': self._get_show_language(show),
                 'imdb_id': imdb_id,
                 'ratings': {
-                    'imdb_rating': imdb_rating
-                } if imdb_rating > 0 else {},
+                    'audience_rating': audience_rating
+                } if audience_rating > 0 else {},
                 'cast': [],
                 'tmdb_keywords': tmdb_keywords
             }
             
-            # Add cast if enabled
             if self.show_cast and hasattr(show, 'roles'):
                 show_info['cast'] = [r.tag for r in show.roles[:3]]
                 
@@ -911,12 +893,10 @@ class PlexTVRecommender:
     def get_unwatched_library_shows(self) -> List[Dict]:
         print(f"\n{YELLOW}Fetching unwatched shows from Plex library...{RESET}")
         
-        # Get current counts
         all_show_ids = self._get_library_shows_set()
         watched_show_ids = self._get_watched_show_ids()
         current_unwatched_count = len(all_show_ids) - len(watched_show_ids)
         
-        # Check if cache is valid
         if (os.path.exists(self.unwatched_cache_path) and 
             self.cached_unwatched_count == current_unwatched_count and 
             self.cached_unwatched_shows):
@@ -925,7 +905,6 @@ class PlexTVRecommender:
             
         print(f"Found {current_unwatched_count} unwatched shows. Analyzing profiles...")
         
-        # Calculate unwatched show IDs
         unwatched_show_ids = all_show_ids - watched_show_ids
         shows_section = self.plex.library.section(self.library_title)
         
@@ -992,7 +971,6 @@ class PlexTVRecommender:
                         if len(collected_recs) >= self.limit_trakt_results:
                             break
     
-                        # Access the nested 'show' object
                         show_data = s.get('show', {})
                         if not show_data:
                             continue
@@ -1000,7 +978,6 @@ class PlexTVRecommender:
                         base_rating = float(show_data.get('rating', 0.0))
                         show_data['_randomized_rating'] = base_rating + random.uniform(0, 0.5)
     
-                    # Sort shows based on the randomized rating
                     shows.sort(key=lambda x: x.get('show', {}).get('_randomized_rating', 0), reverse=True)
     
                     for s in shows:
@@ -1021,7 +998,7 @@ class PlexTVRecommender:
                             continue
     
                         ratings = {
-                            'imdb_rating': round(float(show.get('rating', 0)), 1),
+                            'audience_rating': round(float(show.get('rating', 0)), 1),
                             'votes': show.get('votes', 0)
                         }
                         sd = {
@@ -1089,7 +1066,7 @@ class PlexTVRecommender:
                     break
     
             # Sort and limit the recommendations
-            collected_recs.sort(key=lambda x: x.get('ratings', {}).get('imdb_rating', 0), reverse=True)
+            collected_recs.sort(key=lambda x: x.get('ratings', {}).get('audience_rating', 0), reverse=True)
             random.shuffle(collected_recs)
             final_recs = collected_recs[:self.limit_trakt_results]
             print(f"Collected {len(final_recs)} Trakt recommendations after exclusions.")
@@ -1116,7 +1093,7 @@ class PlexTVRecommender:
                 plex_recs = included_recs
                 plex_recs.sort(
                     key=lambda x: (
-                        x.get('ratings', {}).get('imdb_rating', 0),
+                        x.get('ratings', {}).get('audience_rating', 0),
                         x.get('similarity_score', 0)
                     ),
                     reverse=True
@@ -1461,7 +1438,7 @@ def format_show_output(show: Dict,
                       show_cast: bool = False,
                       show_studio: bool = False,
                       show_language: bool = False,
-                      show_imdb_rating: bool = False,
+                      show_rating: bool = False,
                       show_imdb_link: bool = False) -> str:
     bullet = f"{index}. " if index is not None else "- "
     output = f"{bullet}{CYAN}{show['title']}{RESET} ({show.get('year', 'N/A')})"
@@ -1481,9 +1458,9 @@ def format_show_output(show: Dict,
     if show_language and show.get('language') != "N/A":
         output += f"\n  {YELLOW}Language:{RESET} {show['language']}"
 
-    if show_imdb_rating and show.get('ratings', {}).get('imdb_rating', 0) > 0:
-        rating = show['ratings']['imdb_rating']
-        output += f"\n  {YELLOW}IMDb Rating:{RESET} {rating}/10"
+    if show_rating and show.get('ratings', {}).get('audience_rating', 0) > 0:
+        rating = show['ratings']['audience_rating']
+        output += f"\n  {YELLOW}Rating:{RESET} {rating}/10"
 
     if show_imdb_link and show.get('imdb_id'):
         imdb_link = f"https://www.imdb.com/title/{show['imdb_id']}/"
@@ -1577,7 +1554,7 @@ def main():
                     show_cast=recommender.show_cast,
                     show_studio=recommender.show_studio,
                     show_language=recommender.show_language,
-                    show_imdb_rating=recommender.show_imdb_rating,
+                    show_rating=recommender.show_rating,
                     show_imdb_link=recommender.show_imdb_link
                 ))
                 print()
@@ -1597,7 +1574,7 @@ def main():
                         show_cast=recommender.show_cast,
                         show_studio=recommender.show_studio,
                         show_language=recommender.show_language,
-                        show_imdb_rating=recommender.show_imdb_rating,
+                        show_rating=recommender.show_rating,
                         show_imdb_link=recommender.show_imdb_link
                     ))
                     print()
