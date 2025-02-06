@@ -81,7 +81,7 @@ Rename `config.example.yml` to `config.yml` and set up your credentials and pref
 - **show_summary:** `true` will show you a brief plot summary for each TV Show.
 - **show_cast:** `true` will show top 3 cast members.
 - **show_language:** `true` will show the main language.
-- **show_imdb_rating:** `true` will show IMDb ratings
+- **show_rating:** `true` will show audience ratings
 - **show_imdb_link:** `true` will show an imdb link for each recommended TV Show.
 - **keep_logs:** The amount of logs to keep of your runs. set to `0` to disable logging.
 
