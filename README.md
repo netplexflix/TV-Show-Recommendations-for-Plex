@@ -12,28 +12,30 @@ Requires:
 Optionally requires:
 - [Trakt API key](https://trakt.docs.apiary.io/#) (for movie suggestions outside of your existing library)
 - [Sonarr](https://sonarr.tv/) (for adding new recommendations)
-
+- [Tautulli](https://tautulli.com/) (for fetching external users' watch history)
 
 Also check out [Movie Recommendations for Plex](https://github.com/netplexflix/Movie-Recommendations-for-Plex)
 
 ---
 
 ## ✨ Features
-- 🧠 **Smart Recommendations**: Analyzes your watch history to understand your preferences
-- 🏷️ **Label Management**: Labels recommended TV Shows in Plex
+- 👥 **User Selection**: Analyze your own profile and/or that of selected users.
+- 🧠 **Smart Recommendations**: Analyzes watch history to understand preferences
+- 🏷️ **Label Management**: Labels recommended shows in Plex
 - 🎯 **Sonarr Integration**: Adds external recommendations to your Sonarr wanted list
 - ☑ **Selection**: Confirm recommendations to label and/or add to Sonarr, or have it run unattended
 - 🔍 **Genre Filtering**: Excludes unwanted genres from recommendations
 - 🛠️ **Customizable**: Choose which parameters matter to you
+- 📊 **Rating Multipliers**: Uses User ratings (if present) to improve user profile
 - ☑️ **Trakt Integration**: Uploads your Plex watch history to Trakt if needed and gets personalized recommendations
-- 🗃️ **Caching**: Keeps a cache of operations to speed up subsequent runs and limit API calls
+- 🗃️ **Caching**: Keeps a cache of operations to speed up subsequent runs, limit API calls, and avoid duplicates while syncing
 - 💾 **Path Mapping**: Supports different system configurations (NAS, Linux, Windows)
 - 📒 **Logging**: Keep desired amount of run logs
 
 ---
 ## 🧙‍♂️ How are recommendations picked?
 
-The script checks your Plex library for watched TV Shows and notes its characteristics, such as genre, studio, actors, rating, language, TMDB keywords (if enabled), ...
+The script checks your Plex library for watched TV Shows and notes its characteristics, such as genre, studio, actors, rating, language, TMDB keywords, ...
 It keeps a frequency count of how often each of these characteristics were found to build a profile on what you like watching.
 
 **For each unwatched Plex TV Show**, it calculates a similarity score based on how many of those familiar elements it shares with your watch history, giving extra weight to those you watch more frequently.
@@ -50,7 +52,7 @@ It excludes any titles already in your Plex library or containing excluded genre
 Clone the repository:
 ```sh
 git clone https://github.com/netplexflix/TV-Show-Recommendations-for-Plex.git
-cd Movie-Recommendations-for-Plex
+cd TV-Show-Recommendations-for-Plex
 ```
 
 ![#c5f015](https://placehold.co/15x15/c5f015/c5f015.png) Or simply download by pressing the green 'Code' button above and then 'Download Zip'.
@@ -117,9 +119,19 @@ paths:
 - **url:** Edit if needed.
 - **token:** [Finding your Plex Token](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/)
 - **TV_library_title:** The title of your TV Show Library
+- **managed_users:** Which [Managed Users](https://support.plex.tv/articles/203948776-managed-users/) to analyze. Defaults to Admin.
 - **add_label:** Adds label to the recommended TV Shows in your Plex library if set to `true`
 - **label_name:** The label to be used
+- **append_usernames:** `true` will append the selected usernames to the `label_name`.
 - **remove_previous_recommendations:** If set to `true` removes the label from previously recommendation runs. If set to `false' simply appends the new recommendations.
+
+### Tautulli
+- **url:** Edit if needed.
+- **api_key:** Can be found in Tautulli settings under 'Web Interface'.
+- **users:** Which Tautulli users to analyze. Defaults to `None`.
+
+> [!IMPORTANT]
+> Selecting Tautulli users will override 'managed_users'. You can ofcourse also select managed users via Tautulli.
 
 ### Sonarr
 - **url:** Change if needed
@@ -134,6 +146,7 @@ paths:
  
 ### Trakt
 - Your Trakt API credentials can be found in Trakt under settings => [Your Trakt Apps](https://trakt.tv/oauth/applications) [More info here](https://trakt.docs.apiary.io/#)
+- **clear_watch_history:** `true` will erase your Trakt movie watch history (before syncing). This is recommended if you're doing multiple runs for different user(group)s.
 - **sync_watch_history:** Can be set to `false` if you already build your Trakt watch history another way (e.g.: through Trakt's Plex Scrobbler).
 
 ### TMDB Settings
@@ -141,9 +154,18 @@ paths:
 - **use_TMDB_keywords:** `true` uses TMDB (plot)keywords for matching (Recommended).
 
 ### Weights
-Here you can change the 'weight' or 'importance' some parameters have.</br>
-Make sure the sum of the weights adds up to 1.</br>
-Plex User Ratings, if you use them, automatically apply soft multipliers to scores.
+- Here you can change the 'weight' or 'importance' some parameters have. Make sure the sum of the weights adds up to 1.
+
+> [!NOTE]
+> If you use **User Ratings**, these will be used as multipliers to scale the impact.</br>
+> 
+> **Example:** </br>
+> If you watch a lot of Show with Actor X, the algorithm will assume you enjoy watching them and will score 'Actor X' highly.</br>
+> However it is theoretically possible that you rated all of their shows really poorly (e.g; 1 star)</br>
+> meaning that even though you watched a lot of shows with Actor X, you don't like them.</br>
+> The algorithm will take this into account and will make sure that in this example, Shows with Actor X will have a much lower similarity score.</br>
+> The opposite is also true; If you watched only 2 shows with Actor Y but you rated both really high, then their shows will have a higher similarity score.</br>
+> Shows without UserRating are not affected.
 
 ---
 
@@ -174,10 +196,23 @@ Adding labels instead of directly creating a collection gives you more freedom t
 ![Image](https://github.com/user-attachments/assets/94165b37-454a-4b3d-89bd-225b812c1db1)
 ![Image](https://github.com/user-attachments/assets/2a5ff157-bf91-4a2c-a341-be025115b636)
 
+### 👥 User-based collections
+If you are doing multiple runs analyzing different users(groups) and use `append_usernames` for the label, you can make a "What should I watch?" smart collection for each of those user(group) labels.
+In Plex, you can make these collections visible only to the relevant users.
+Edit your collection, go to 'Labels' and add a new label for the collection. **IMPORTANT:** This label has to be different from the labels used to tag the shows! Otherwise all shows within the collection will also be invisible to all other users.
+
+Now go to Plex settings → Manage Library Access
+For each user other than the person who is allowed to see this collection: click on their names, go to 'Restrictions' → click 'edit' next to TV SHOWS → under 'EXCLUDE LABELS' add the label you gave the collection. (Again IMPORTANT: Do NOT use the username tag!) and save changes. Repeat this for any "What Should I watch?" collection you have made for user(group)s.
+
+If you have many users, I made a script to do this in bulk: 🏷️[User Restrictions Label Manager for Plex](https://github.com/netplexflix/User-Restrictions-Label-Manager-for-Plex)
+
+> [!IMPORTANT]
+> Exclusion rules unfortunately do NOT work when pinning a collection to the home page.</br>
+> Collections pinned to "Friends' Home" will be visible to all your users, regardless of the exclusion labels. I hope they fix this at some point..
+
 ---
 
 ### ⚠️ Need Help or have Feedback?
-- Open an [Issue](https://github.com/netplexflix/TV-Show-Recommendations-for-Plex/issues) on GitHub
 - Join our [Discord](https://discord.gg/VBNUJd7tx3)
 
 ---
