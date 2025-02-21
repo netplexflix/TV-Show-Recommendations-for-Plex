@@ -15,7 +15,7 @@ from urllib.parse import quote
 import re
 from datetime import datetime, timedelta
 
-__version__ = "2.0b04"
+__version__ = "2.0b05"
 REPO_URL = "https://github.com/netplexflix/TV-Show-Recommendations-for-Plex"
 API_VERSION_URL = f"https://api.github.com/repos/netplexflix/TV-Show-Recommendations-for-Plex/releases/latest"
 
@@ -1993,8 +1993,66 @@ class PlexTVRecommender:
                         continue
     
                     if tvdb_id in existing_tvdb_ids:
-                        print(f"{YELLOW}Already in Sonarr: {show['title']}{RESET}")
-                        continue
+                        # Find the existing show
+                        existing_show = next(s for s in existing_shows if s['tvdbId'] == tvdb_id)
+                        
+                        # If config wants monitoring and show is currently unmonitored
+                        if monitor_option != 'none' and not existing_show['monitored']:
+                            print(f"{YELLOW}Show already in Sonarr (unmonitored): {show['title']}{RESET}")
+                            print(f"{GREEN}Updating monitoring status...{RESET}")
+                            
+                            update_data = existing_show.copy()
+                            update_data['monitored'] = True
+                            
+                            # Handle first season monitoring
+                            if monitor_option == 'firstSeason':
+                                try:
+                                    tmdb_seasons_url = f"https://api.themoviedb.org/3/tv/{tmdb_id}"
+                                    tmdb_params = {'api_key': self.tmdb_api_key}
+                                    resp = requests.get(tmdb_seasons_url, params=tmdb_params)
+                                    if resp.status_code == 200:
+                                        show_data = resp.json()
+                                        update_data['seasons'] = [
+                                            {
+                                                'seasonNumber': s['season_number'],
+                                                'monitored': s['season_number'] == 1
+                                            } 
+                                            for s in show_data.get('seasons', [])
+                                            if s.get('season_number', -1) >= 0
+                                        ]
+                                except Exception as e:
+                                    print(f"{YELLOW}Failed to get season data: {e}. Monitoring all.{RESET}")
+                                    
+                            try:
+                                # Update the show in Sonarr
+                                update_resp = requests.put(
+                                    f"{sonarr_url}/series/{existing_show['id']}", 
+                                    headers=headers, 
+                                    json=update_data
+                                )
+                                update_resp.raise_for_status()
+                                
+                                # If search_missing is enabled, trigger a search
+                                if search_missing:
+                                    search_cmd = {'name': 'SeriesSearch', 'seriesIds': [existing_show['id']]}
+                                    sr = requests.post(f"{sonarr_url}/command", headers=headers, json=search_cmd)
+                                    sr.raise_for_status()
+                                    print(f"{GREEN}Updated monitoring and triggered search for: {show['title']}{RESET}")
+                                else:
+                                    print(f"{GREEN}Updated monitoring for: {show['title']}{RESET}")
+                                    
+                            except requests.exceptions.RequestException as e:
+                                print(f"{RED}Error updating {show['title']} in Sonarr: {str(e)}{RESET}")
+                                if hasattr(e, 'response') and e.response is not None:
+                                    try:
+                                        error_details = e.response.json()
+                                        print(f"{RED}Sonarr error details: {json.dumps(error_details, indent=2)}{RESET}")
+                                    except:
+                                        print(f"{RED}Sonarr error response: {e.response.text}{RESET}")
+                            continue
+                        else:
+                            print(f"{YELLOW}Already in Sonarr: {show['title']}{RESET}")
+                            continue
     
                     seasons = []
                     if monitor_option == 'firstSeason':
