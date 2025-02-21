@@ -15,7 +15,7 @@ from urllib.parse import quote
 import re
 from datetime import datetime, timedelta
 
-__version__ = "2.0b03"
+__version__ = "2.0b04"
 REPO_URL = "https://github.com/netplexflix/TV-Show-Recommendations-for-Plex"
 API_VERSION_URL = f"https://api.github.com/repos/netplexflix/TV-Show-Recommendations-for-Plex/releases/latest"
 
@@ -734,7 +734,23 @@ class PlexTVRecommender:
     def _get_library_shows_set(self) -> Set[tuple]:
         try:
             shows = self.plex.library.section(self.library_title)
-            return {(show.title.lower(), show.year) for show in shows.all()}
+            library_shows = set()
+            for show in shows.all():
+                # Handle both normal titles and titles with embedded years
+                title = show.title.lower()
+                year = show.year
+                
+                # Add normal version
+                library_shows.add((title, year))
+                
+                # Check for and strip embedded year pattern
+                year_match = re.search(r'\s*\((\d{4})\)$', title)
+                if year_match:
+                    clean_title = title.replace(year_match.group(0), '').strip()
+                    embedded_year = int(year_match.group(1))
+                    library_shows.add((clean_title, embedded_year))
+                
+            return library_shows
         except Exception as e:
             print(f"{RED}Error getting library shows: {e}{RESET}")
             return set()
@@ -752,10 +768,26 @@ class PlexTVRecommender:
     def _is_show_in_library(self, title: str, year: Optional[int]) -> bool:
         if not title:
             return False
+            
         title_lower = title.lower()
+        
+        # Check for year in title and strip it if found
+        year_match = re.search(r'\s*\((\d{4})\)$', title_lower)
+        if year_match:
+            clean_title = title_lower.replace(year_match.group(0), '').strip()
+            embedded_year = int(year_match.group(1))
+            if (clean_title, embedded_year) in self.library_shows:
+                return True
+        
+        # Check both with and without year
         if (title_lower, year) in self.library_shows:
             return True
-        return any(lib_title == title_lower for lib_title, _ in self.library_shows)
+            
+        # Check title-only matches
+        return any(lib_title == title_lower or 
+                  lib_title == f"{title_lower} ({year})" or
+                  lib_title.replace(f" ({year})", "") == title_lower 
+                  for lib_title, lib_year in self.library_shows)
 
     def _process_show_counters(self, show, counters):
         show_details = self.get_show_details(show)
