@@ -15,7 +15,7 @@ from urllib.parse import quote
 import re
 from datetime import datetime, timedelta
 
-__version__ = "2.0b08"
+__version__ = "2.0b09"
 REPO_URL = "https://github.com/netplexflix/TV-Show-Recommendations-for-Plex"
 API_VERSION_URL = f"https://api.github.com/repos/netplexflix/TV-Show-Recommendations-for-Plex/releases/latest"
 
@@ -589,15 +589,7 @@ class PlexTVRecommender:
     
         print(f"{YELLOW}{not_found_count} watched shows not found in library{RESET}")
         return self._normalize_all_counters(counters)
-    
-    def _is_valid_show_entry(self, entry: dict) -> bool:
-        return (
-            isinstance(entry, dict) and 
-            entry.get('media_type') == 'episode' and
-            isinstance(entry.get('metadata'), dict) and
-            entry['metadata'].get('title')
-        )
-    
+       
     def _get_managed_users_watched_data(self):
         counters = {
             'genres': Counter(),
@@ -648,20 +640,12 @@ class PlexTVRecommender:
     # ------------------------------------------------------------------------
     def _save_watched_cache(self):
         try:
-            # Convert TVDB IDs set to list for JSON serialization
-            tvdb_ids = list(self.watched_data.get('tvdb_ids', set())) if isinstance(self.watched_data.get('tvdb_ids'), set) else self.watched_data.get('tvdb_ids', [])
-            
-            # Get watch dates
-            watch_dates = self.watched_data.get('watch_dates', {})
-            
             cache_data = {
                 'watched_count': self.cached_watched_count,
-                'watched_data_counters': self.watched_data_counters,
+                'watched_data_counters': self.watched_data_counters,  # Contains all necessary data
                 'plex_tmdb_cache': self.plex_tmdb_cache,
                 'tmdb_keywords_cache': self.tmdb_keywords_cache,
                 'watched_show_ids': list(self.watched_show_ids),
-                'tvdb_ids': tvdb_ids,
-                'watch_dates': watch_dates,
                 'last_updated': datetime.now().isoformat()
             }
             
@@ -753,16 +737,6 @@ class PlexTVRecommender:
             return library_shows
         except Exception as e:
             print(f"{RED}Error getting library shows: {e}{RESET}")
-            return set()
-
-    def _get_watched_show_ids(self) -> Set[int]:
-        try:
-            shows_section = self.plex.library.section(self.library_title)
-            watched_episodes = shows_section.searchEpisodes(unwatched=False)
-            # Extract unique show IDs from watched episodes
-            return {ep.grandparentRatingKey for ep in watched_episodes}
-        except Exception as e:
-            print(f"{RED}Error getting watched episodes: {e}{RESET}")
             return set()
 
     def _is_show_in_library(self, title: str, year: Optional[int]) -> bool:
@@ -1016,7 +990,7 @@ class PlexTVRecommender:
             return resp.json().get('tv_results', [{}])[0].get('id')
         except Exception as e:
             print(f"{YELLOW}IMDb fallback failed: {e}{RESET}")
-            return Non
+            return None
 
     def _get_plex_show_tmdb_id(self, plex_show) -> Optional[int]:
         # Recursion guard and cache check
@@ -1178,71 +1152,6 @@ class PlexTVRecommender:
         except Exception as e:
             print(f"DEBUG: Error extracting genres for {show.title}: {str(e)}")
         return genres
-
-    def _get_watched_shows_data(self) -> Dict:
-        print(f"\n{YELLOW}Fetching watched shows from Plex library...{RESET}")
-        genre_counter = Counter()
-        studio_counter = Counter()
-        actor_counter = Counter()
-        tmdb_keyword_counter = Counter()
-        language_counter = Counter()
-
-        try:
-            shows_section = self.plex.library.section(self.library_title)
-            watched_shows = shows_section.search(unwatched=False)
-            total_watched = len(watched_shows)
-
-            print(f"Found {total_watched} watched shows. Building frequency data...")
-            for i, show in enumerate(watched_shows, start=1):
-                self._show_progress("Analyzing watched shows", i, total_watched)
-
-                user_rating = getattr(show, 'userRating', None)
-                if user_rating is not None:
-                    rating_weight = float(user_rating) / 10.0
-                    rating_weight = min(max(rating_weight, 0.1), 1.0)
-                else:
-                    rating_weight = 0.5
-
-                if hasattr(show, 'genres') and show.genres:
-                    for g in show.genres:
-                        if isinstance(g, plexapi.media.Genre) and hasattr(g, 'tag'):
-                            genre_counter[g.tag.lower()] += rating_weight
-                        elif isinstance(g, str):
-                            genre_counter[g.lower()] += rating_weight
-
-                if hasattr(show, 'studio') and show.studio:
-                    studio_counter[show.studio.lower()] += rating_weight
-
-                if hasattr(show, 'roles') and show.roles:
-                    for a in show.roles:
-                        actor_counter[a.tag] += rating_weight
-
-                if self.show_language:
-                    try:
-                        language = self._get_show_language(show)
-                        language_counter[language.lower()] += rating_weight
-                    except Exception as e:
-                        print(f"{YELLOW}Error getting language for '{show.title}': {e}{RESET}")
-
-                if self.use_tmdb_keywords and self.tmdb_api_key:
-                    tmdb_id = self._get_plex_show_tmdb_id(show)
-                    if tmdb_id:
-                        keywords = self._get_tmdb_keywords_for_id(tmdb_id)
-                        for kw in keywords:
-                            tmdb_keyword_counter[kw] += rating_weight
-
-            print()
-
-        except plexapi.exceptions.BadRequest as e:
-            print(f"{RED}Error gathering watched shows data: {e}{RESET}")
-
-        return {
-            'genres': dict(genre_counter),
-            'studio': dict(studio_counter),
-            'actors': dict(actor_counter),
-            'tmdb_keywords': dict(tmdb_keyword_counter),
-            'languages': dict(language_counter)
-        }
 
     def _show_progress(self, prefix: str, current: int, total: int):
         pct = int((current / total) * 100)
