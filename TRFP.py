@@ -15,7 +15,7 @@ from urllib.parse import quote
 import re
 from datetime import datetime, timedelta
 
-__version__ = "2.0b01"
+__version__ = "2.0b03"
 REPO_URL = "https://github.com/netplexflix/TV-Show-Recommendations-for-Plex"
 API_VERSION_URL = f"https://api.github.com/repos/netplexflix/TV-Show-Recommendations-for-Plex/releases/latest"
 
@@ -731,10 +731,10 @@ class PlexTVRecommender:
     # ------------------------------------------------------------------------
     # LIBRARY UTILITIES
     # ------------------------------------------------------------------------
-    def _get_library_shows_set(self) -> Set[int]:
+    def _get_library_shows_set(self) -> Set[tuple]:
         try:
             shows = self.plex.library.section(self.library_title)
-            return {show.ratingKey for show in shows.all()}
+            return {(show.title.lower(), show.year) for show in shows.all()}
         except Exception as e:
             print(f"{RED}Error getting library shows: {e}{RESET}")
             return set()
@@ -750,7 +750,12 @@ class PlexTVRecommender:
             return set()
 
     def _is_show_in_library(self, title: str, year: Optional[int]) -> bool:
-        return (title.lower(), year) in self.library_shows
+        if not title:
+            return False
+        title_lower = title.lower()
+        if (title_lower, year) in self.library_shows:
+            return True
+        return any(lib_title == title_lower for lib_title, _ in self.library_shows)
 
     def _process_show_counters(self, show, counters):
         show_details = self.get_show_details(show)
@@ -1579,15 +1584,15 @@ class PlexTVRecommender:
                     for s in shows:
                         if len(collected_recs) >= self.limit_trakt_results:
                             break
-    
+                
                         show = s.get('show', {})
                         if not show:
                             continue
-    
+                
                         title = show.get('title', '').strip()
                         year = show.get('year', None)
-    
-                        if not title:
+                
+                        if not title or self._is_show_in_library(title, year):
                             continue
     
                         if self._is_show_in_library(title, year):
@@ -2072,18 +2077,42 @@ ANSI_PATTERN = re.compile(r'\x1b\[[0-9;]*m')
 class TeeLogger:
     """
     A simple 'tee' class that writes to both console and a file,
-    stripping ANSI color codes for the file.
+    stripping ANSI color codes for the file and handling Unicode characters.
     """
     def __init__(self, logfile):
         self.logfile = logfile
+        # Force UTF-8 encoding for stdout
+        if hasattr(sys.stdout, 'buffer'):
+            self.stdout_buffer = sys.stdout.buffer
+        else:
+            self.stdout_buffer = sys.stdout
     
     def write(self, text):
-        sys.__stdout__.write(text)
-        stripped = ANSI_PATTERN.sub('', text)
-        self.logfile.write(stripped)
+        try:
+            # Write to console
+            if hasattr(sys.stdout, 'buffer'):
+                self.stdout_buffer.write(text.encode('utf-8'))
+            else:
+                sys.__stdout__.write(text)
+            
+            # Write to file (strip ANSI codes)
+            stripped = ANSI_PATTERN.sub('', text)
+            self.logfile.write(stripped)
+        except UnicodeEncodeError:
+            # Fallback for problematic characters
+            safe_text = text.encode('ascii', 'replace').decode('ascii')
+            if hasattr(sys.stdout, 'buffer'):
+                self.stdout_buffer.write(safe_text.encode('utf-8'))
+            else:
+                sys.__stdout__.write(safe_text)
+            stripped = ANSI_PATTERN.sub('', safe_text)
+            self.logfile.write(stripped)
     
     def flush(self):
-        sys.__stdout__.flush()
+        if hasattr(sys.stdout, 'buffer'):
+            self.stdout_buffer.flush()
+        else:
+            sys.__stdout__.flush()
         self.logfile.flush()
 
 def cleanup_old_logs(log_dir: str, keep_logs: int):
