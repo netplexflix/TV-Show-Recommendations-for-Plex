@@ -15,7 +15,7 @@ from urllib.parse import quote
 import re
 from datetime import datetime, timedelta
 
-__version__ = "2.0b05"
+__version__ = "2.0b06"
 REPO_URL = "https://github.com/netplexflix/TV-Show-Recommendations-for-Plex"
 API_VERSION_URL = f"https://api.github.com/repos/netplexflix/TV-Show-Recommendations-for-Plex/releases/latest"
 
@@ -1865,7 +1865,7 @@ class PlexTVRecommender:
         if not self.sonarr_config.get('add_to_sonarr'):
             return
     
-        valid_options = ['all', 'none', 'firstseason']
+        valid_options = ['all', 'none', 'firstSeason']  # Maintaining case sensitivity
         monitor_option = self.sonarr_config.get('monitor_option', 'all')
         search_missing = self.sonarr_config.get('search_missing', False)
         
@@ -1883,10 +1883,12 @@ class PlexTVRecommender:
                 choice = input(f"Choose monitoring [default: {monitor_option}]: ").strip().lower()
                 if not choice:
                     break
-                if choice in valid_options:
-                    monitor_option = choice
+                if choice in [opt.lower() for opt in valid_options]:
+                    monitor_option = next(opt for opt in valid_options if opt.lower() == choice)
                     break
                 print(f"{RED}Invalid option. Valid choices: {', '.join(valid_options)}{RESET}")
+        else:
+            selected_shows = recommended_shows
     
         try:
             if 'sonarr' not in self.config:
@@ -2001,46 +2003,50 @@ class PlexTVRecommender:
                             print(f"{YELLOW}Show already in Sonarr (unmonitored): {show['title']}{RESET}")
                             print(f"{GREEN}Updating monitoring status...{RESET}")
                             
-                            update_data = existing_show.copy()
-                            update_data['monitored'] = True
-                            
-                            # Handle first season monitoring
-                            if monitor_option == 'firstSeason':
-                                try:
-                                    tmdb_seasons_url = f"https://api.themoviedb.org/3/tv/{tmdb_id}"
-                                    tmdb_params = {'api_key': self.tmdb_api_key}
-                                    resp = requests.get(tmdb_seasons_url, params=tmdb_params)
-                                    if resp.status_code == 200:
-                                        show_data = resp.json()
-                                        update_data['seasons'] = [
-                                            {
-                                                'seasonNumber': s['season_number'],
-                                                'monitored': s['season_number'] == 1
-                                            } 
-                                            for s in show_data.get('seasons', [])
-                                            if s.get('season_number', -1) >= 0
-                                        ]
-                                except Exception as e:
-                                    print(f"{YELLOW}Failed to get season data: {e}. Monitoring all.{RESET}")
-                                    
+                            # Get full series data from Sonarr
                             try:
-                                # Update the show in Sonarr
-                                update_resp = requests.put(
+                                series_response = requests.get(
                                     f"{sonarr_url}/series/{existing_show['id']}", 
-                                    headers=headers, 
-                                    json=update_data
+                                    headers=headers
                                 )
-                                update_resp.raise_for_status()
+                                series_response.raise_for_status()
+                                current_series = series_response.json()
                                 
-                                # If search_missing is enabled, trigger a search
-                                if search_missing:
-                                    search_cmd = {'name': 'SeriesSearch', 'seriesIds': [existing_show['id']]}
-                                    sr = requests.post(f"{sonarr_url}/command", headers=headers, json=search_cmd)
-                                    sr.raise_for_status()
-                                    print(f"{GREEN}Updated monitoring and triggered search for: {show['title']}{RESET}")
-                                else:
-                                    print(f"{GREEN}Updated monitoring for: {show['title']}{RESET}")
+                                update_data = current_series.copy()
+                                update_data['monitored'] = True
+                                
+                                if 'seasons' in current_series:
+                                    update_data['seasons'] = [
+                                        {
+                                            'seasonNumber': season['seasonNumber'],
+                                            'monitored': (monitor_option == 'all') or 
+                                                        (monitor_option == 'firstSeason' and season['seasonNumber'] == 1),
+                                            'statistics': season.get('statistics', {}),
+                                        }
+                                        for season in current_series['seasons']
+                                        if season['seasonNumber'] != 0  # Exclude specials
+                                    ]
                                     
+                                    print(f"{GREEN}Updating season monitoring status for: {show['title']}{RESET}")
+                                    print(f"Setting seasons to monitored: {'All seasons' if monitor_option == 'all' else 'Season 1 only'}")
+                                    
+                                    # Update the show in Sonarr
+                                    update_resp = requests.put(
+                                        f"{sonarr_url}/series/{existing_show['id']}", 
+                                        headers=headers, 
+                                        json=update_data
+                                    )
+                                    update_resp.raise_for_status()
+                                    
+                                    # If search_missing is enabled, trigger a search
+                                    if search_missing:
+                                        search_cmd = {'name': 'SeriesSearch', 'seriesIds': [existing_show['id']]}
+                                        sr = requests.post(f"{sonarr_url}/command", headers=headers, json=search_cmd)
+                                        sr.raise_for_status()
+                                        print(f"{GREEN}Updated monitoring and triggered search for: {show['title']}{RESET}")
+                                    else:
+                                        print(f"{GREEN}Updated monitoring for: {show['title']}{RESET}")
+                                        
                             except requests.exceptions.RequestException as e:
                                 print(f"{RED}Error updating {show['title']} in Sonarr: {str(e)}{RESET}")
                                 if hasattr(e, 'response') and e.response is not None:
@@ -2054,6 +2060,7 @@ class PlexTVRecommender:
                             print(f"{YELLOW}Already in Sonarr: {show['title']}{RESET}")
                             continue
     
+                    # Handle new show addition
                     seasons = []
                     if monitor_option == 'firstSeason':
                         try:
@@ -2107,10 +2114,12 @@ class PlexTVRecommender:
                         search_cmd = {'name': 'SeriesSearch', 'seriesIds': [new_id]}
                         sr = requests.post(f"{sonarr_url}/command", headers=headers, json=search_cmd)
                         sr.raise_for_status()
-                        print(f"Triggered download search for: {show['title']}")
+                        print(f"{GREEN}Added and triggered download search for: {show['title']}{RESET}")
+                    else:
+                        print(f"{GREEN}Added: {show['title']}{RESET}")
     
                 except requests.exceptions.RequestException as e:
-                    print(f"{RED}Error adding {show['title']} to Sonarr: {str(e)}{RESET}")
+                    print(f"{RED}Error processing {show['title']}: {str(e)}{RESET}")
                     if hasattr(e, 'response') and e.response is not None:
                         try:
                             error_details = e.response.json()
