@@ -15,7 +15,7 @@ from urllib.parse import quote
 import re
 from datetime import datetime, timedelta
 
-__version__ = "2.0b06"
+__version__ = "2.0b07"
 REPO_URL = "https://github.com/netplexflix/TV-Show-Recommendations-for-Plex"
 API_VERSION_URL = f"https://api.github.com/repos/netplexflix/TV-Show-Recommendations-for-Plex/releases/latest"
 
@@ -1998,10 +1998,10 @@ class PlexTVRecommender:
                         # Find the existing show
                         existing_show = next(s for s in existing_shows if s['tvdbId'] == tvdb_id)
                         
-                        # If config wants monitoring and show is currently unmonitored
-                        if monitor_option != 'none' and not existing_show['monitored']:
-                            print(f"{YELLOW}Show already in Sonarr (unmonitored): {show['title']}{RESET}")
-                            print(f"{GREEN}Updating monitoring status...{RESET}")
+                        # If monitoring is enabled in config
+                        if monitor_option != 'none':
+                            print(f"{YELLOW}Show already in Sonarr: {show['title']}{RESET}")
+                            print(f"{GREEN}Checking monitoring status...{RESET}")
                             
                             # Get full series data from Sonarr
                             try:
@@ -2015,20 +2015,20 @@ class PlexTVRecommender:
                                 update_data = current_series.copy()
                                 update_data['monitored'] = True
                                 
+                                # Update season monitoring based on monitor_option
                                 if 'seasons' in current_series:
                                     update_data['seasons'] = [
                                         {
                                             'seasonNumber': season['seasonNumber'],
-                                            'monitored': (monitor_option == 'all') or 
-                                                        (monitor_option == 'firstSeason' and season['seasonNumber'] == 1),
+                                            'monitored': (
+                                                monitor_option == 'all' or 
+                                                (monitor_option == 'firstSeason' and season['seasonNumber'] == 1)
+                                            ),
                                             'statistics': season.get('statistics', {}),
                                         }
                                         for season in current_series['seasons']
                                         if season['seasonNumber'] != 0  # Exclude specials
                                     ]
-                                    
-                                    print(f"{GREEN}Updating season monitoring status for: {show['title']}{RESET}")
-                                    print(f"Setting seasons to monitored: {'All seasons' if monitor_option == 'all' else 'Season 1 only'}")
                                     
                                     # Update the show in Sonarr
                                     update_resp = requests.put(
@@ -2038,14 +2038,18 @@ class PlexTVRecommender:
                                     )
                                     update_resp.raise_for_status()
                                     
+                                    monitoring_message = 'all seasons' if monitor_option == 'all' else 'first season'
+                                    print(f"{GREEN}Updated show and {monitoring_message} monitoring for: {show['title']}{RESET}")
+                                    
                                     # If search_missing is enabled, trigger a search
                                     if search_missing:
-                                        search_cmd = {'name': 'SeriesSearch', 'seriesIds': [existing_show['id']]}
+                                        search_cmd = {
+                                            'name': 'MissingEpisodeSearch',
+                                            'seriesId': existing_show['id']
+                                        }
                                         sr = requests.post(f"{sonarr_url}/command", headers=headers, json=search_cmd)
                                         sr.raise_for_status()
-                                        print(f"{GREEN}Updated monitoring and triggered search for: {show['title']}{RESET}")
-                                    else:
-                                        print(f"{GREEN}Updated monitoring for: {show['title']}{RESET}")
+                                        print(f"{GREEN}Triggered search for: {show['title']}{RESET}")
                                         
                             except requests.exceptions.RequestException as e:
                                 print(f"{RED}Error updating {show['title']} in Sonarr: {str(e)}{RESET}")
@@ -2090,13 +2094,13 @@ class PlexTVRecommender:
                         'qualityProfileId': quality_profile_id,
                         'seasonFolder': True,
                         'rootFolderPath': root_folder,
-                        'monitored': monitor_option != 'none',
+                        'monitored': True,
                         'addOptions': {
                             'searchForMissingEpisodes': search_missing,
-                            'monitor': monitor_option if monitor_option != 'firstSeason' else 'none'
+                            'monitor': monitor_option
                         }
                     }
-    
+                    
                     if seasons:
                         show_data['seasons'] = seasons
                     elif monitor_option == 'firstSeason':
