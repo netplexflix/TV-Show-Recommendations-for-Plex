@@ -15,7 +15,7 @@ from urllib.parse import quote
 import re
 from datetime import datetime, timedelta
 
-__version__ = "2.0b07"
+__version__ = "2.0b08"
 REPO_URL = "https://github.com/netplexflix/TV-Show-Recommendations-for-Plex"
 API_VERSION_URL = f"https://api.github.com/repos/netplexflix/TV-Show-Recommendations-for-Plex/releases/latest"
 
@@ -1705,7 +1705,7 @@ class PlexTVRecommender:
             return []
 
     def get_recommendations(self) -> Dict[str, List[Dict]]:
-        trakt_config = self.config.get('trakt', {})		
+        trakt_config = self.config.get('trakt', {})        
         # Check if we need to clear Trakt history first
         if trakt_config.get('clear_watch_history', False):
             self._clear_trakt_watch_history()
@@ -1719,38 +1719,58 @@ class PlexTVRecommender:
         if plex_recs:
             excluded_recs = [s for s in plex_recs if any(g in self.exclude_genres for g in s['genres'])]
             included_recs = [s for s in plex_recs if not any(g in self.exclude_genres for g in s['genres'])]
-
+    
+            print(f"Excluded {len(excluded_recs)} shows based on excluded genres.")
+    
             if not included_recs:
                 print(f"{YELLOW}No unwatched shows left after applying genre exclusions.{RESET}")
                 plex_recs = []
             else:
-                plex_recs = included_recs
-                plex_recs.sort(
-                    key=lambda x: (
-                        x.get('ratings', {}).get('audience_rating', 0),
-                        x.get('similarity_score', 0)
-                    ),
-                    reverse=True
-                )
-                top_count = max(int(len(plex_recs) * 0.5), self.limit_plex_results)
-                top_by_rating = plex_recs[:top_count]
-
-                top_by_rating.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
-                final_count = max(int(len(top_by_rating) * 0.3), self.limit_plex_results)
-                final_pool = top_by_rating[:final_count]
-
-                if final_pool:
-                    plex_recs = random.sample(final_pool, min(self.limit_plex_results, len(final_pool)))
+                # Get shows section
+                shows_section = self.plex.library.section(self.library_title)
+                
+                # Calculate similarity scores using actual Plex show objects
+                print(f"\n{YELLOW}Calculating similarity scores...{RESET}")
+                scored_shows = []
+                total_shows = len(included_recs)
+                
+                for i, show_info in enumerate(included_recs, 1):
+                    self._show_progress("Processing", i, total_shows)
+                    try:
+                        # Find the actual Plex show object
+                        plex_show = next(
+                            (s for s in shows_section.search(title=show_info['title'])
+                             if s.year == show_info.get('year')), 
+                            None
+                        )
+                        if plex_show:
+                            # Calculate score using the Plex show object
+                            similarity_score = self.calculate_show_score(plex_show)
+                            show_info['similarity_score'] = similarity_score
+                            scored_shows.append(show_info)
+                    except Exception as e:
+                        continue
+    
+                # Sort by similarity score
+                scored_shows.sort(key=lambda x: x['similarity_score'], reverse=True)
+    
+                # Take top 20% of shows by similarity score
+                top_count = max(int(len(scored_shows) * 0.2), self.limit_plex_results)
+                top_pool = scored_shows[:top_count]
+    
+                # Randomly select from the top pool
+                if top_pool:
+                    plex_recs = random.sample(top_pool, min(self.limit_plex_results, len(top_pool)))
                 else:
                     plex_recs = []
         else:
             plex_recs = []
-
+    
         trakt_recs = []
         if not self.plex_only:
             trakt_recs = self.get_trakt_recommendations()
-
-        print(f"Recommendation process completed!")
+    
+        print(f"\nRecommendation process completed!")
         return {
             'plex_recommendations': plex_recs,
             'trakt_recommendations': trakt_recs
