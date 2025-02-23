@@ -15,7 +15,7 @@ from urllib.parse import quote
 import re
 from datetime import datetime, timedelta
 
-__version__ = "2.0b09"
+__version__ = "2.0b10"
 REPO_URL = "https://github.com/netplexflix/TV-Show-Recommendations-for-Plex"
 API_VERSION_URL = f"https://api.github.com/repos/netplexflix/TV-Show-Recommendations-for-Plex/releases/latest"
 
@@ -1741,6 +1741,20 @@ class PlexTVRecommender:
         try:
             shows_section = self.plex.library.section(self.library_title)
             label_name = self.config['plex'].get('label_name', 'Recommended')
+    
+            # Append usernames to label if configured
+            if self.config['plex'].get('append_usernames', False):
+                users = []
+                if self.users['tautulli_users']:
+                    users = self.users['tautulli_users']
+                else:
+                    users = self.users['managed_users']
+                
+                if users:
+                    # Sanitize usernames and join with underscores
+                    sanitized_users = [re.sub(r'\W+', '_', user.strip()) for user in users]
+                    user_suffix = '_'.join(sanitized_users)
+                    label_name = f"{label_name}_{user_suffix}"
 
             shows_to_update = []
             for rec in selected_shows:
