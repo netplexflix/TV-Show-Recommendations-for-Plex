@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 import math
 import copy
 
-__version__ = "2.0b13"
+__version__ = "2.0b14"
 REPO_URL = "https://github.com/netplexflix/TV-Show-Recommendations-for-Plex"
 API_VERSION_URL = f"https://api.github.com/repos/netplexflix/TV-Show-Recommendations-for-Plex/releases/latest"
 
@@ -417,7 +417,6 @@ class PlexTVRecommender:
         
         # Update cache paths to be user-specific
         self.watched_cache_path = os.path.join(self.cache_dir, f"watched_cache_{safe_ctx}.json")
-        self.unwatched_cache_path = os.path.join(self.cache_dir, f"unwatched_cache_{safe_ctx}.json")
         self.trakt_cache_path = os.path.join(self.cache_dir, f"trakt_sync_cache_{safe_ctx}.json")
         self.trakt_sync_cache_path = os.path.join(self.cache_dir, "trakt_sync_cache.json")
          
@@ -459,18 +458,7 @@ class PlexTVRecommender:
             show_id for show_id in self.watched_show_ids
             if show_id in current_library_ids
         }
-		
-        # Load unwatched cache
-        if os.path.exists(self.unwatched_cache_path):
-            try:
-                with open(self.unwatched_cache_path, 'r', encoding='utf-8') as f:
-                    unwatched_cache = json.load(f)
-                    self.cached_library_show_count = unwatched_cache.get('library_show_count', 0)
-                    self.cached_unwatched_count = unwatched_cache.get('unwatched_count', 0)
-                    self.cached_unwatched_shows = unwatched_cache.get('unwatched_show_details', [])
-            except Exception as e:
-                print(f"{YELLOW}Error loading unwatched cache: {e}{RESET}") 
-				
+						
         if self.plex_tmdb_cache is None:
             self.plex_tmdb_cache = {}
         if self.tmdb_keywords_cache is None:
@@ -681,24 +669,9 @@ class PlexTVRecommender:
             except Exception as e:
                 print(f"{YELLOW}Error getting watch count: {e}{RESET}")
                 return 0
-				
-    def _get_tautulli_watched_shows_data(self) -> Dict:
-        if not self.single_user and hasattr(self, 'watched_data_counters') and self.watched_data_counters:
-            return self.watched_data_counters
-    
-        shows_section = self.plex.library.section(self.library_title)
-        counters = {
-            'genres': Counter(),
-            'studio': Counter(),
-            'actors': Counter(),
-            'languages': Counter(),
-            'tmdb_keywords': Counter(),
-            'tmdb_ids': set()
-        }
-        watched_show_ids = set()
-        not_found_count = 0
-    
-        print(f"{YELLOW}Resolving Tautulli user IDs...{RESET}")
+
+    def _get_tautulli_user_ids(self):
+        """Resolve configured Tautulli usernames to their user IDs"""
         user_ids = []
         try:
             # Get all Tautulli users
@@ -724,14 +697,32 @@ class PlexTVRecommender:
                 )
                 if user:
                     user_ids.append(str(user['user_id']))
-                    print(f"Matched '{username}' to ID: {user['user_id']}")
                 else:
                     print(f"{RED}User '{username}' not found in Tautulli!{RESET}")
     
         except Exception as e:
             print(f"{RED}Error resolving Tautulli users: {e}{RESET}")
-            return self._normalize_all_counters(counters)
+        
+        return user_ids
+		
+    def _get_tautulli_watched_shows_data(self) -> Dict:
+        if not self.single_user and hasattr(self, 'watched_data_counters') and self.watched_data_counters:
+            return self.watched_data_counters
     
+        shows_section = self.plex.library.section(self.library_title)
+        counters = {
+            'genres': Counter(),
+            'studio': Counter(),
+            'actors': Counter(),
+            'languages': Counter(),
+            'tmdb_keywords': Counter(),
+            'tmdb_ids': set()
+        }
+        watched_show_ids = set()
+        not_found_count = 0
+    
+        print(f"{YELLOW}Resolving Tautulli user IDs...{RESET}")
+        user_ids = self._get_tautulli_user_ids()
         if not user_ids:
             print(f"{RED}No valid Tautulli users found!{RESET}")
             return self._normalize_all_counters(counters)
@@ -902,20 +893,6 @@ class PlexTVRecommender:
         except Exception as e:
             print(f"{YELLOW}Error saving watched cache: {e}{RESET}")
 
-    def _save_unwatched_cache(self):
-        try:
-            cache_data = {
-                'library_show_count': self.cached_library_show_count,
-                'unwatched_count': self.cached_unwatched_count,
-                'unwatched_show_details': self.cached_unwatched_shows,
-                'last_updated': datetime.now().isoformat()
-            }
-            with open(self.unwatched_cache_path, 'w', encoding='utf-8') as f:
-                json.dump(cache_data, f, indent=4, ensure_ascii=False)
-                
-        except Exception as e:
-            print(f"{YELLOW}Error saving unwatched cache: {e}{RESET}")
-
     def _save_trakt_sync_cache(self):
         try:
             with open(self.trakt_sync_cache_path, 'w', encoding='utf-8') as f:
@@ -928,7 +905,6 @@ class PlexTVRecommender:
 
     def _save_cache(self):
         self._save_watched_cache()
-        self._save_unwatched_cache()
 
     def _process_show_counters_from_cache(self, show_info: Dict, counters: Dict) -> None:
         try:
@@ -1203,65 +1179,6 @@ class PlexTVRecommender:
         except Exception as e:
             print(f"{YELLOW}Error getting show details for {show.title}: {e}{RESET}")
             return {}
-
-    def get_unwatched_library_shows(self) -> List[Dict]:
-        print(f"\n{YELLOW}Checking unwatched shows...{RESET}")
-        
-        # Get current library show count
-        shows_section = self.plex.library.section(self.library_title)
-        all_shows = shows_section.all()
-        current_library_count = len(all_shows)
-        
-        # Check if we can use cached data
-        cache_is_valid = (
-            os.path.exists(self.unwatched_cache_path) and
-            current_library_count == self.cached_library_show_count and
-            len(self.cached_unwatched_shows) == self.cached_unwatched_count
-        )
-        
-        if cache_is_valid:
-            print(f"Unwatched count unchanged. Using cached data for {self.cached_unwatched_count} shows")
-            return self.cached_unwatched_shows
-            
-        # If we reach here, we need to rescan
-        print(f"Rescanning library for unwatched shows...")
-        print(f"Found {current_library_count} shows in Plex library")
-    
-        # Calculate unwatched shows using cached watched IDs
-        unwatched_details = []
-        excluded_count = 0
-        
-        for i, show in enumerate(all_shows, 1):
-            self._show_progress("Validating shows", i, current_library_count)
-            
-            # Skip if show is in watched cache
-            if show.ratingKey in self.watched_show_ids:
-                continue
-                
-            try:
-                info = self.get_show_details(show)
-                
-                # Skip genre-excluded shows
-                show_genres = info.get('genres', [])
-                if any(g in self.exclude_genres for g in show_genres):
-                    excluded_count += 1
-                    continue
-                    
-                unwatched_details.append(info)
-                
-            except Exception as e:
-                print(f"{YELLOW}Error processing {show.title}: {e}{RESET}")
-                continue
-    
-        print(f"Found {len(unwatched_details)} unwatched shows")
-    
-        # Update cache
-        self.cached_library_show_count = current_library_count
-        self.cached_unwatched_count = len(unwatched_details)
-        self.cached_unwatched_shows = unwatched_details
-        self._save_unwatched_cache()
-    
-        return unwatched_details
 		
     def _validate_watched_shows(self):
         cleaned_ids = set()
@@ -1606,54 +1523,126 @@ class PlexTVRecommender:
     
         print(f"\n{YELLOW}Starting Trakt watch history sync...{RESET}")
         
-        # Load existing synced IDs from cache
-        synced_tvdb_ids = set()
-        if os.path.exists(self.trakt_sync_cache_path):
-            try:
-                with open(self.trakt_sync_cache_path, 'r') as f:
-                    cache_data = json.load(f)
-                    synced_tvdb_ids = set(cache_data.get('synced_tvdb_ids', []))
-                    print(f"Loaded {len(synced_tvdb_ids)} previously synced episode IDs from cache")
-            except Exception as e:
-                print(f"{YELLOW}Error loading Trakt sync cache: {e}{RESET}")
-    
-        # Get TVDB IDs and watch dates from watched cache
-        watched_tvdb_ids = set(self.watched_data.get('tvdb_ids', []))
-        watch_dates = self.watched_data.get('watch_dates', {})
+        watched_episodes = []
         
-        if not watched_tvdb_ids:
-            print(f"{YELLOW}No watched episodes with TVDB IDs found.{RESET}")
+        if self.users['tautulli_users']:
+            # Get Tautulli history for watched episodes
+            user_ids = self._get_tautulli_user_ids()
+            for user_id in user_ids:
+                start = 0
+                while True:
+                    params = {
+                        'apikey': self.config['tautulli']['api_key'],
+                        'cmd': 'get_history',
+                        'media_type': 'episode',
+                        'user_id': user_id,
+                        'length': 1000
+                    }
+                    response = requests.get(f"{self.config['tautulli']['url']}/api/v2", params=params)
+                    data = response.json()['response']['data']
+                    
+                    if isinstance(data, dict):
+                        history_items = data.get('data', [])
+                    else:
+                        history_items = data
+                    
+                    for item in history_items:
+                        if item.get('watched_status') == 1:  # Only fully watched episodes
+                            try:
+                                # Convert timestamp
+                                timestamp = int(item['date'])
+                                watched_date = datetime.fromtimestamp(timestamp)
+                                trakt_date = watched_date.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                                
+                                # Get TVDB ID from Plex using rating_key
+                                episode = self.plex.fetchItem(int(item['rating_key']))
+                                tvdb_id = None
+                                if hasattr(episode, 'guids'):
+                                    for guid in episode.guids:
+                                        if 'tvdb://' in guid.id:
+                                            tvdb_id = int(guid.id.split('tvdb://')[1].split('?')[0])
+                                            break
+                                
+                                if tvdb_id:
+                                    watched_episodes.append({
+                                        'tvdb_id': tvdb_id,
+                                        'show_title': item['grandparent_title'],
+                                        'season': item['parent_media_index'],
+                                        'episode': item['media_index'],
+                                        'watched_at': trakt_date
+                                    })
+                                    
+                            except Exception as e:
+                                print(f"{YELLOW}Error processing Tautulli history item: {e}{RESET}")
+                                continue
+                            
+                    if len(history_items) < 1000:
+                        break
+                    start += len(history_items)
+        else:
+            # Get Plex history for watched episodes
+            for show_id in self.watched_show_ids:
+                show = self.plex.fetchItem(show_id)
+                for episode in show.episodes():
+                    if episode.isWatched and hasattr(episode, 'guids'):
+                        tvdb_id = None
+                        for guid in episode.guids:
+                            if 'tvdb://' in guid.id:
+                                tvdb_id = int(guid.id.split('tvdb://')[1].split('?')[0])
+                                break
+                        
+                        if tvdb_id:
+                            watched_at = None
+                            if hasattr(episode, 'lastViewedAt'):
+                                if isinstance(episode.lastViewedAt, datetime):
+                                    watched_at = episode.lastViewedAt
+                                else:
+                                    watched_at = datetime.fromtimestamp(int(episode.lastViewedAt))
+                            
+                            watched_episodes.append({
+                                'tvdb_id': tvdb_id,
+                                'show_title': show.title,
+                                'season': episode.seasonNumber,
+                                'episode': episode.index,
+                                'watched_at': watched_at.strftime("%Y-%m-%dT%H:%M:%S.000Z") if watched_at else None
+                            })
+    
+        if not watched_episodes:
+            print(f"{YELLOW}No episodes found to sync to Trakt{RESET}")
             return
     
-        # Find unsynced TVDB IDs
-        to_sync = watched_tvdb_ids - synced_tvdb_ids
-        if not to_sync:
-            print(f"{GREEN}All watched episodes already synced to Trakt.{RESET}")
-            return
+#        # Show preview
+#        print(f"\nFound {len(watched_episodes)} episodes to sync:")
+#        for ep in watched_episodes[:5]:
+#            print(f"- {ep['show_title']} S{ep['season']:02d}E{ep['episode']:02d} "
+#                  f"[TVDB: {ep['tvdb_id']}] (watched: {ep['watched_at']})")
+#        if len(watched_episodes) > 5:
+#            print(f"... and {len(watched_episodes) - 5} more episodes")
+#    
+#        if self.confirm_operations:
+#            choice = input("\nProceed with Trakt sync? (y/n): ").lower()
+#            if choice not in ['y', 'yes']:
+#                print("Sync cancelled by user")
+#                return
     
-        print(f"Found {len(to_sync)} episodes to sync to Trakt")
-        
         # Sync in batches
         batch_size = 100
         newly_synced = set()
         
-        for i in range(0, len(to_sync), batch_size):
-            batch = list(to_sync)[i:i+batch_size]
+        for i in range(0, len(watched_episodes), batch_size):
+            batch = watched_episodes[i:i+batch_size]
             
-            # Prepare payload for episodes with actual watch dates
             payload = {
                 "episodes": [
                     {
                         "ids": {
-                            "tvdb": episode_id
+                            "tvdb": ep['tvdb_id']
                         },
-                        "watched_at": watch_dates.get(episode_id, datetime.now().strftime("%Y-%m-%dT%H:%M:%S.000Z"))
+                        "watched_at": ep['watched_at']
                     }
-                    for episode_id in batch
+                    for ep in batch
                 ]
             }
-    
-            print(f"Sending batch {i//batch_size + 1} to Trakt...")
     
             try:
                 response = requests.post(
@@ -1664,10 +1653,9 @@ class PlexTVRecommender:
                                 
                 if response.status_code == 201:
                     response_data = response.json()
-                    
                     added_episodes = response_data.get('added', {}).get('episodes', 0)
                     if added_episodes > 0:
-                        newly_synced.update(batch)
+                        newly_synced.update(ep['tvdb_id'] for ep in batch)
                         print(f"{GREEN}Successfully synced {added_episodes} episodes{RESET}")
                     else:
                         print(f"{YELLOW}Warning: No episodes were added in this batch{RESET}")
@@ -1683,11 +1671,10 @@ class PlexTVRecommender:
     
         # Update and save Trakt sync cache
         if newly_synced:
-            synced_tvdb_ids.update(newly_synced)
             try:
                 with open(self.trakt_sync_cache_path, 'w') as f:
                     json.dump({
-                        'synced_tvdb_ids': list(synced_tvdb_ids),
+                        'synced_episode_ids': list(newly_synced),
                         'last_sync': datetime.now().isoformat()
                     }, f, indent=4)
                 print(f"Successfully synced {len(newly_synced)} episodes to Trakt")
@@ -1907,9 +1894,6 @@ class PlexTVRecommender:
                         year = show.get('year', None)
                 
                         if not title or self._is_show_in_library(title, year):
-                            continue
-    
-                        if self._is_show_in_library(title, year):
                             continue
     
                         ratings = {
