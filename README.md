@@ -73,7 +73,8 @@ Rename `config.example.yml` to `config.yml` and set up your credentials and pref
 
 ### General
 - **confirm_operations:** `true` will prompt you for extra confirmation for applying labels in plex (If `add_label` is `true`) or adding to Sonarr (If `add_to_sonarr` is `true`). Set to `false` for unattended runs.
-- **plex_only:** Set to `true` if you only want recommendations among your unwatched Plex TV Shows. Set to `false` if you also want external recommendations (to optionally add to Sonarr).
+- **plex_only:** `true` if you only want recommendations among your unwatched Plex TV Shows. `false` if you also want external recommendations (to optionally add to Sonarr).
+- **combine_watch_history:** `true` will treat multiple users entered as a single group. `false` will do consecutive indivdual runs.
 - **limit_plex_results:** Limit amount of recommended unwatched TV Shows from within your Plex library.
 - **limit_trakt_results:** Limit amount of recommended TV Shows from outside your Plex library.
 - **exclude_genre:** Genres to exclude. E.g. "animation, documentary".
