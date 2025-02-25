@@ -1,6 +1,7 @@
 general:
   confirm_operations: true
   plex_only: false
+  combine_watch_history: false
   limit_plex_results: 3
   limit_trakt_results: 3
   exclude_genre: none
