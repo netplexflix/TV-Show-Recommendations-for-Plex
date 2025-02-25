@@ -3,7 +3,9 @@ general:
   plex_only: false
   limit_plex_results: 3
   limit_trakt_results: 3
-  exclude_genre: animation, documentary,
+  exclude_genre: none
+  randomize_recommendations: true
+  normalize_counters: true
   show_summary: true
   show_cast: true
   show_language: true
@@ -50,7 +52,6 @@ trakt:
  
 TMDB:
   api_key: YOUR_TMDB_API_KEY
-  use_TMDB_keywords: true
 
 weights: #Make sure the total equals 1
   genre_weight: 0.25

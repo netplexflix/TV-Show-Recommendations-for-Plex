@@ -14,8 +14,9 @@ import json
 from urllib.parse import quote
 import re
 from datetime import datetime, timedelta
+import math
 
-__version__ = "2.0b10"
+__version__ = "2.0b12"
 REPO_URL = "https://github.com/netplexflix/TV-Show-Recommendations-for-Plex"
 API_VERSION_URL = f"https://api.github.com/repos/netplexflix/TV-Show-Recommendations-for-Plex/releases/latest"
 
@@ -94,6 +95,178 @@ def check_version():
     except Exception as e:
         print(f"{YELLOW}Unable to check for updates: {str(e)}{RESET}")
 
+class ShowCache:
+    def __init__(self, cache_dir: str):
+        self.all_shows_cache_path = os.path.join(cache_dir, "all_shows_cache.json")
+        self.cache = self._load_cache()
+        
+    def _load_cache(self) -> Dict:
+        if os.path.exists(self.all_shows_cache_path):
+            try:
+                with open(self.all_shows_cache_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"{YELLOW}Error loading all shows cache: {e}{RESET}")
+                return {'shows': {}, 'last_updated': None, 'library_count': 0}
+        return {'shows': {}, 'last_updated': None, 'library_count': 0}
+    
+    def update_cache(self, plex, library_title: str, tmdb_api_key: Optional[str] = None):
+        shows_section = plex.library.section(library_title)
+        all_shows = shows_section.all()
+        current_count = len(all_shows)
+        
+        # If library count unchanged, no need to update
+        if current_count == self.cache['library_count']:
+            print(f"{GREEN}Show cache is up to date{RESET}")
+            return False
+            
+        print(f"\n{YELLOW}Analyzing library shows...{RESET}")
+        
+        # If library count changed, clean up removed shows first
+        current_shows = set(str(show.ratingKey) for show in all_shows)
+        removed = set(self.cache['shows'].keys()) - current_shows
+        
+        if removed:
+            print(f"{YELLOW}Removing {len(removed)} shows from cache that are no longer in library{RESET}")
+            for show_id in removed:
+                del self.cache['shows'][show_id]
+        
+        # Get existing show IDs
+        existing_ids = set(self.cache['shows'].keys())
+        new_shows = [show for show in all_shows if str(show.ratingKey) not in existing_ids]
+        
+        if new_shows:
+            print(f"Found {len(new_shows)} new shows to analyze")
+            
+            # Find and process only new shows
+            for i, show in enumerate(new_shows, 1):
+                msg = f"\r{CYAN}Processing show {i}/{len(new_shows)} ({int((i/len(new_shows))*100)}%){RESET}"
+                sys.stdout.write(msg)
+                sys.stdout.flush()
+                
+                show_id = str(show.ratingKey)
+                try:
+                    show.reload()
+                    
+                    # Get IMDB ID from show GUIDs
+                    imdb_id = None
+                    tmdb_id = None
+                    if hasattr(show, 'guids'):
+                        for guid in show.guids:
+                            if 'imdb://' in guid.id:
+                                imdb_id = guid.id.replace('imdb://', '')
+                            elif 'themoviedb://' in guid.id:
+                                try:
+                                    tmdb_id = int(guid.id.split('themoviedb://')[1].split('?')[0])
+                                except (ValueError, IndexError):
+                                    pass
+                    
+                    # If no TMDB ID found but we have API key, try to find it
+                    if not tmdb_id and tmdb_api_key:
+                        try:
+                            params = {
+                                'api_key': tmdb_api_key,
+                                'query': show.title,
+                                'first_air_date_year': getattr(show, 'year', None)
+                            }
+                            resp = requests.get(
+                                "https://api.themoviedb.org/3/search/tv",
+                                params=params,
+                                timeout=10
+                            )
+                            if resp.status_code == 200:
+                                results = resp.json().get('results', [])
+                                if results:
+                                    tmdb_id = results[0]['id']
+                        except Exception as e:
+                            print(f"{YELLOW}Error getting TMDB ID for {show.title}: {e}{RESET}")
+                    
+                    # Get TMDB keywords if we have ID and API key
+                    tmdb_keywords = []
+                    if tmdb_id and tmdb_api_key:
+                        try:
+                            kw_resp = requests.get(
+                                f"https://api.themoviedb.org/3/tv/{tmdb_id}/keywords",
+                                params={'api_key': tmdb_api_key}
+                            )
+                            if kw_resp.status_code == 200:
+                                keywords = kw_resp.json().get('results', [])
+                                tmdb_keywords = [k['name'].lower() for k in keywords]
+                        except Exception as e:
+                            print(f"{YELLOW}Error getting TMDB keywords for {show.title}: {e}{RESET}")
+                    
+                    show_info = {
+                        'title': show.title,
+                        'year': getattr(show, 'year', None),
+                        'genres': [g.tag.lower() for g in show.genres] if hasattr(show, 'genres') else [],
+                        'studio': getattr(show, 'studio', 'N/A'),
+                        'cast': [r.tag for r in show.roles[:3]] if hasattr(show, 'roles') else [],
+                        'summary': getattr(show, 'summary', ''),
+                        'language': self._get_show_language(show),
+                        'tmdb_keywords': tmdb_keywords,
+                        'tmdb_id': tmdb_id,
+                        'imdb_id': imdb_id
+                    }
+                    self.cache['shows'][show_id] = show_info
+                    
+                except Exception as e:
+                    print(f"{YELLOW}Error processing show {show.title}: {e}{RESET}")
+                    continue
+                    
+        self.cache['library_count'] = current_count
+        self.cache['last_updated'] = datetime.now().isoformat()
+        self._save_cache()
+        print(f"{GREEN}Show cache updated{RESET}")
+        return True
+        
+    def _save_cache(self):
+        try:
+            with open(self.all_shows_cache_path, 'w', encoding='utf-8') as f:
+                json.dump(self.cache, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print(f"{RED}Error saving all shows cache: {e}{RESET}")
+
+    def _get_show_language(self, show) -> str:
+        """Get show's primary audio language from first episode"""
+        try:
+            episodes = show.episodes()
+            if not episodes:
+                return "N/A"
+    
+            episode = episodes[0]
+            episode.reload()
+            
+            if not episode.media:
+                return "N/A"
+                
+            for media in episode.media:
+                for part in media.parts:
+                    audio_streams = part.audioStreams()
+                    
+                    if audio_streams:
+                        audio = audio_streams[0]                     
+                        lang_code = (
+                            getattr(audio, 'languageTag', None) or
+                            getattr(audio, 'language', None)
+                        )
+                        if lang_code:
+                            return get_full_language_name(lang_code)
+                            
+        except Exception as e:
+            print(f"DEBUG: Language detection failed: {str(e)}")
+        return "N/A"
+
+    def cleanup_removed_shows(self):
+        """Remove shows from cache that no longer exist in the library"""
+        current_shows = set(str(show.ratingKey) for show in self.plex.library.section(self.library_title).all())
+        removed = set(self.cache['shows'].keys()) - current_shows
+        
+        if removed:
+            print(f"{YELLOW}Removing {len(removed)} shows from cache that are no longer in library{RESET}")
+            for show_id in removed:
+                del self.cache['shows'][show_id]
+            self._save_cache()
+
 class PlexTVRecommender:
     def __init__(self, config_path: str):
         self.config = self._load_config(config_path)
@@ -109,7 +282,7 @@ class PlexTVRecommender:
         self.plex_tmdb_cache = {}
         self.tmdb_keywords_cache = {}
         self.tautulli_watched_rating_keys = set()
-        self.watched_show_ids = set()  # New set for tracking all watched shows
+        self.watched_show_ids = set()
         self.users = self._get_configured_users()
     
         print("Initializing recommendation system...")
@@ -120,18 +293,29 @@ class PlexTVRecommender:
         print("Connecting to Plex server...")
         self.plex = self._init_plex()
         print(f"Connected to Plex successfully!\n")
-        print(f"{YELLOW}Checking Cache...{RESET}")
+        print(f"{YELLOW}Checking Cache...{RESET}")	
+        tmdb_config = self.config.get('TMDB', {})
+        self.use_tmdb_keywords = tmdb_config.get('use_TMDB_keywords', True)
+        self.tmdb_api_key = tmdb_config.get('api_key', None)
 		
+        self.cache_dir = os.path.join(os.path.dirname(__file__), "cache")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.show_cache = ShowCache(self.cache_dir)
+        self.show_cache.update_cache(self.plex, self.library_title, self.tmdb_api_key)
+			
         general_config = self.config.get('general', {})
         self.confirm_operations = general_config.get('confirm_operations', False)
         self.limit_plex_results = general_config.get('limit_plex_results', 10)
         self.limit_trakt_results = general_config.get('limit_trakt_results', 10)
+        self.randomize_recommendations = general_config.get('randomize_recommendations', True)
+        self.normalize_counters = general_config.get('normalize_counters', True)
         self.show_summary = general_config.get('show_summary', False)
         self.plex_only = general_config.get('plex_only', False)
         self.show_cast = general_config.get('show_cast', False)
         self.show_language = general_config.get('show_language', False)
         self.show_rating = general_config.get('show_rating', False)
         self.show_imdb_link = general_config.get('show_imdb_link', False)
+        self.debug = general_config.get('debug', False)
         
         exclude_genre_str = general_config.get('exclude_genre', '')
         self.exclude_genres = [g.strip().lower() for g in exclude_genre_str.split(',') if g.strip()] if exclude_genre_str else []
@@ -201,14 +385,9 @@ class PlexTVRecommender:
         if not self.plex.library.section(self.library_title):
             raise ValueError(f"TV Show library '{self.library_title}' not found in Plex")
         
-        tmdb_config = self.config.get('TMDB', {})
-        self.use_tmdb_keywords = tmdb_config.get('use_TMDB_keywords', False)
-        self.tmdb_api_key = tmdb_config.get('api_key', None)
+
 
         self.sonarr_config = self.config.get('sonarr', {})
-
-        self.cache_dir = os.path.join(os.path.dirname(__file__), "cache")
-        os.makedirs(self.cache_dir, exist_ok=True)
         
         # Get user context for cache files
         if self.users['tautulli_users']:
@@ -233,14 +412,17 @@ class PlexTVRecommender:
                     self.watched_data_counters = watched_cache.get('watched_data_counters', {})
                     self.plex_tmdb_cache = watched_cache.get('plex_tmdb_cache', {})
                     self.tmdb_keywords_cache = watched_cache.get('tmdb_keywords_cache', {})
-                    # Load both watched show tracking mechanisms
-                    self.tautulli_watched_rating_keys = set(watched_cache.get('tautulli_watched_rating_keys', []))
-                    self.watched_show_ids = set(watched_cache.get('watched_show_ids', []))
-                    # Verify TMDB IDs are loaded
+                    
+                    # Convert watched show IDs to integers when loading from cache
+                    watched_ids = watched_cache.get('watched_show_ids', [])
+                    self.watched_show_ids = {int(id_) for id_ in watched_ids if str(id_).isdigit()}
+                                       
+                    if not self.watched_show_ids and self.cached_watched_count > 0:
+                        print(f"{RED}Warning: Cached watched count is {self.cached_watched_count} but no valid IDs loaded{RESET}")
                     
             except Exception as e:
                 print(f"{YELLOW}Error loading watched cache: {e}{RESET}")
-    
+        self._validate_watched_shows()    
         current_library_ids = self._get_library_shows_set()
         
         # Clean up both watched show tracking mechanisms
@@ -573,21 +755,18 @@ class PlexTVRecommender:
         # Store watched show IDs in class
         self.watched_show_ids.update(watched_show_ids)
         
-        # Process shows for recommendation data
+        # Use cached show data instead of querying Plex again
         print(f"\nProcessing {len(watched_show_ids)} unique watched shows from Tautulli history:")
-        for i, rating_key in enumerate(watched_show_ids, 1):
+        for i, show_id in enumerate(watched_show_ids, 1):
             self._show_progress("Processing", i, len(watched_show_ids))
-            try:
-                show = shows_section.fetchItem(rating_key)
-                if show:
-                    show.reload()
-                    self._process_show_counters(show, counters)
-                else:
-                    not_found_count += 1
-            except Exception:
+            
+            show_info = self.show_cache.cache['shows'].get(str(show_id))
+            if show_info:
+                self._process_show_counters_from_cache(show_info, counters)
+            else:
                 not_found_count += 1
     
-        print(f"{YELLOW}{not_found_count} watched shows not found in library{RESET}")
+        print(f"{YELLOW}{not_found_count} watched shows not found in cache{RESET}")
         return self._normalize_all_counters(counters)
        
     def _get_managed_users_watched_data(self):
@@ -612,22 +791,16 @@ class PlexTVRecommender:
                     user = account.user(username)
                     user_plex = self.plex.switchUser(user)
                 
-                tv_sections = [
-                    section for section in user_plex.library.sections()
-                    if section.type == 'show'
-                ]
-                if not tv_sections:
-                    print(f"{RED}User {username} has no accessible TV libraries.{RESET}")
-                    continue
+                watched_shows = user_plex.library.section(self.library_title).search(unwatched=False)
                 
-                shows_section = tv_sections[0]
-                watched_shows = shows_section.search(unwatched=False)
-                
-                print(f"\nScanning watched shows for {username} in library: {shows_section.title}")
+                print(f"\nScanning watched shows for {username}")
                 for i, show in enumerate(watched_shows, 1):
                     self._show_progress(f"Processing {username}'s watched", i, len(watched_shows))
-                    self.watched_show_ids.add(show.ratingKey)
-                    self._process_show_counters(show, counters)
+                    self.watched_show_ids.add(int(show.ratingKey))
+                    
+                    show_info = self.show_cache.cache['shows'].get(str(show.ratingKey))
+                    if show_info:
+                        self._process_show_counters_from_cache(show_info, counters)
                     
             except Exception as e:
                 print(f"{RED}Error processing user {username}: {e}{RESET}")
@@ -683,6 +856,42 @@ class PlexTVRecommender:
         self._save_watched_cache()
         self._save_unwatched_cache()
 
+    def _process_show_counters_from_cache(self, show_info: Dict, counters: Dict) -> None:
+        try:
+            rating = float(show_info.get('user_rating', 0))
+            if not rating:
+                rating = float(show_info.get('audience_rating', 5.0))
+            rating = max(0, min(10, int(round(rating))))
+            multiplier = RATING_MULTIPLIERS.get(rating, 1.0)
+    
+            # Process all counters using cached data
+            for genre in show_info.get('genres', []):
+                counters['genres'][genre] += multiplier
+            
+            if studio := show_info.get('studio'):
+                counters['studio'][studio.lower()] += multiplier
+                
+            for actor in show_info.get('cast', [])[:3]:
+                counters['actors'][actor] += multiplier
+                
+            if language := show_info.get('language'):
+                counters['languages'][language.lower()] += multiplier
+                
+            for keyword in show_info.get('tmdb_keywords', []):
+                counters['tmdb_keywords'][keyword] += multiplier
+    
+            # Handle TVDB IDs and watch dates if present
+            if tvdb_id := show_info.get('tvdb_id'):
+                if 'tvdb_ids' not in counters:
+                    counters['tvdb_ids'] = set()
+                if 'watch_dates' not in counters:
+                    counters['watch_dates'] = {}
+                counters['tvdb_ids'].add(tvdb_id)
+                if watch_date := show_info.get('last_watched'):
+                    counters['watch_dates'][tvdb_id] = watch_date
+    
+        except Exception as e:
+            print(f"{YELLOW}Error processing counters for {show_info.get('title')}: {e}{RESET}")
     # ------------------------------------------------------------------------
     # PATH HANDLING
     # ------------------------------------------------------------------------
@@ -830,8 +1039,14 @@ class PlexTVRecommender:
         if not counter:
             return {}
         
-        max_value = max(counter.values()) if counter else 1
-        return {k: v/max_value for k, v in counter.items()}
+        if self.normalize_counters:
+            max_value = max(counter.values()) if counter else 1
+            return {
+                k: round(0.5 + (math.log(v + 1) / math.log(max_value + 1)), 2) 
+                for k, v in counter.items()
+            }
+        else:
+            return {k: round(float(v), 2) for k, v in counter.items()}
 
     def _normalize_all_counters(self, counters):
         normalized = {
@@ -973,7 +1188,16 @@ class PlexTVRecommender:
         self.cached_unwatched_shows = unwatched_details
         self._save_unwatched_cache()
     
-        return unwatched_details	
+        return unwatched_details
+		
+    def _validate_watched_shows(self):
+        cleaned_ids = set()
+        for show_id in self.watched_show_ids:
+            try:
+                cleaned_ids.add(int(str(show_id)))
+            except (ValueError, TypeError):
+                print(f"{YELLOW}Invalid watched show ID found: {show_id}{RESET}")
+        self.watched_show_ids = cleaned_ids
     # ------------------------------------------------------------------------
     # TMDB HELPER METHODS
     # ------------------------------------------------------------------------
@@ -1382,88 +1606,147 @@ class PlexTVRecommender:
     # ------------------------------------------------------------------------
     # CALCULATE SCORES
     # ------------------------------------------------------------------------
-    def calculate_show_score(self, show) -> float:
+    def _calculate_similarity_from_cache(self, show_info: Dict) -> Tuple[float, Dict]:
+        """Calculate similarity score using cached show data and return score with breakdown"""
         try:
-            user_genres = Counter(self.watched_data.get('genres', {}))
-            user_studio = Counter(self.watched_data.get('studio', {}))
-            user_acts = Counter(self.watched_data.get('actors', {}))
-            user_kws = Counter(self.watched_data.get('tmdb_keywords', {}))
-            user_langs = Counter(self.watched_data.get('languages', {}))
-    
-            weights = self.weights
             score = 0.0
-    
-            # Calculate maximum counts for normalization
-            max_genre_count = max(user_genres.values()) if user_genres else 1
-            max_studio_count = max(user_studio.values()) if user_studio else 1
-            max_actor_count = max(user_acts.values()) if user_acts else 1
-            max_keyword_count = max(user_kws.values()) if user_kws else 1
-            max_language_count = max(user_langs.values()) if user_langs else 1
+            score_breakdown = {
+                'genre_score': 0.0,
+                'studio_score': 0.0,
+                'actor_score': 0.0,
+                'language_score': 0.0,
+                'keyword_score': 0.0,
+                'details': {
+                    'genres': [],
+                    'studio': None,
+                    'actors': [],
+                    'language': None,
+                    'keywords': []
+                }
+            }
+            
+            weights = self.weights
+            user_prefs = {
+                'genres': Counter(self.watched_data.get('genres', {})),
+                'studio': Counter(self.watched_data.get('studio', {})),
+                'actors': Counter(self.watched_data.get('actors', {})),
+                'languages': Counter(self.watched_data.get('languages', {})),
+                'keywords': Counter(self.watched_data.get('tmdb_keywords', {}))
+            }
+            
+            max_counts = {
+                'genres': max(user_prefs['genres'].values()) if user_prefs['genres'] else 1,
+                'studio': max(user_prefs['studio'].values()) if user_prefs['studio'] else 1,
+                'actors': max(user_prefs['actors'].values()) if user_prefs['actors'] else 1,
+                'languages': max(user_prefs['languages'].values()) if user_prefs['languages'] else 1,
+                'keywords': max(user_prefs['keywords'].values()) if user_prefs['keywords'] else 1
+            }
     
             # Genre Score
-            show_genres = set(self._extract_genres(show))
+            show_genres = set(show_info.get('genres', []))
             if show_genres:
                 genre_scores = []
                 for genre in show_genres:
-                    genre_count = user_genres.get(genre, 0)
+                    genre_count = user_prefs['genres'].get(genre, 0)
                     if genre_count > 0:
-                        genre_scores.append(genre_count / max_genre_count)
+                        normalized_score = genre_count / max_counts['genres']
+                        genre_scores.append(normalized_score)
+                        score_breakdown['details']['genres'].append(
+                            f"{genre} (count: {genre_count}, norm: {round(normalized_score, 2)})"
+                        )
                 if genre_scores:
-                    score += (sum(genre_scores) / len(genre_scores)) * weights.get('genre_weight', 0.25)
+                    genre_final = (sum(genre_scores) / len(genre_scores)) * weights.get('genre_weight', 0.25)
+                    score += genre_final
+                    score_breakdown['genre_score'] = round(genre_final, 3)
     
-            # studio Score
-            if hasattr(show, 'studio') and show.studio:
-                studio_scores = []
-                for studio in show.studio:
-                    if hasattr(studio, 'tag') and studio.tag in user_studio:
-                        studio_scores.append(user_studio[studio.tag] / max_studio_count)
-                if studio_scores:
-                    score += (sum(studio_scores) / len(studio_scores)) * weights.get('studio_weight', 0.20)
+            # Studio Score
+            if show_info.get('studio') and show_info['studio'] != 'N/A':
+                studio_count = user_prefs['studio'].get(show_info['studio'].lower(), 0)
+                if studio_count > 0:
+                    normalized_score = studio_count / max_counts['studio']
+                    studio_final = normalized_score * weights.get('studio_weight', 0.20)
+                    score += studio_final
+                    score_breakdown['studio_score'] = round(studio_final, 3)
+                    score_breakdown['details']['studio'] = f"{show_info['studio']} (count: {studio_count}, norm: {round(normalized_score, 2)})"
     
             # Actor Score
-            if hasattr(show, 'roles') and show.roles:
+            show_cast = show_info.get('cast', [])
+            if show_cast:
                 actor_scores = []
                 matched_actors = 0
-                for actor in show.roles:
-                    if hasattr(actor, 'tag') and actor.tag in user_acts:
+                for actor in show_cast:
+                    actor_count = user_prefs['actors'].get(actor, 0)
+                    if actor_count > 0:
                         matched_actors += 1
-                        actor_scores.append(user_acts[actor.tag] / max_actor_count)
+                        normalized_score = actor_count / max_counts['actors']
+                        actor_scores.append(normalized_score)
+                        score_breakdown['details']['actors'].append(
+                            f"{actor} (count: {actor_count}, norm: {round(normalized_score, 2)})"
+                        )
                 if matched_actors > 0:
                     actor_score = sum(actor_scores) / matched_actors
                     if matched_actors > 3:
                         actor_score *= (3 / matched_actors)  # Normalize if many matches
-                    score += actor_score * weights.get('actor_weight', 0.20)
+                    actor_final = actor_score * weights.get('actor_weight', 0.20)
+                    score += actor_final
+                    score_breakdown['actor_score'] = round(actor_final, 3)
     
             # Language Score
-            if self.show_language:
-                try:
-                    language = self._get_show_language(show)
-                    if language != "N/A":
-                        lang_count = user_langs.get(language.lower(), 0)
-                        if lang_count > 0:
-                            score += (lang_count / max_language_count) * weights.get('language_weight', 0.10)
-                except Exception as e:
-                    print(f"{YELLOW}Error calculating language score: {e}{RESET}")
+            show_language = show_info.get('language', 'N/A')
+            if show_language != 'N/A':
+                show_lang_lower = show_language.lower()
+                            
+                lang_count = user_prefs['languages'].get(show_lang_lower, 0)
+                
+                if lang_count > 0:
+                    normalized_score = lang_count / max_counts['languages']
+                    lang_final = normalized_score * weights.get('language_weight', 0.10)
+                    score += lang_final
+                    score_breakdown['language_score'] = round(lang_final, 3)
+                    score_breakdown['details']['language'] = f"{show_language} (count: {lang_count}, norm: {round(normalized_score, 2)})"
     
             # TMDB Keywords Score
-            if self.use_tmdb_keywords and self.tmdb_api_key:
-                tmdb_id = self._get_plex_show_tmdb_id(show)
-                if tmdb_id:
-                    keywords = self._get_tmdb_keywords_for_id(tmdb_id)
-                    keyword_scores = []
-                    for kw in keywords:
-                        count = user_kws.get(kw, 0)
-                        if count > 0:
-                            keyword_scores.append(count / max_keyword_count)
-                    if keyword_scores:
-                        score += (sum(keyword_scores) / len(keyword_scores)) * weights.get('keyword_weight', 0.25)
+            if self.use_tmdb_keywords and show_info.get('tmdb_keywords'):
+                keyword_scores = []
+                for kw in show_info['tmdb_keywords']:
+                    count = user_prefs['keywords'].get(kw, 0)
+                    if count > 0:
+                        normalized_score = count / max_counts['keywords']
+                        keyword_scores.append(normalized_score)
+                        score_breakdown['details']['keywords'].append(
+                            f"{kw} (count: {count}, norm: {round(normalized_score, 2)})"
+                        )
+                if keyword_scores:
+                    keyword_final = (sum(keyword_scores) / len(keyword_scores)) * weights.get('keyword_weight', 0.25)
+                    score += keyword_final
+                    score_breakdown['keyword_score'] = round(keyword_final, 3)
     
-            return score
+            return score, score_breakdown
     
         except Exception as e:
-            print(f"{YELLOW}Error calculating score for {show.title}: {e}{RESET}")
-            return 0.0
+            print(f"{YELLOW}Error calculating similarity score for {show_info.get('title', 'Unknown')}: {e}{RESET}")
+            return 0.0, score_breakdown
 
+    def _print_similarity_breakdown(self, show_info: Dict, score: float, breakdown: Dict):
+        """Print detailed breakdown of similarity score calculation"""
+        print(f"\n{CYAN}Similarity Score Breakdown for '{show_info['title']}'{RESET}")
+        print(f"Total Score: {round(score * 100, 1)}%")
+        print(f"├─ Genre Score: {round(breakdown['genre_score'] * 100, 1)}%")
+        if breakdown['details']['genres']:
+            print(f"│  └─ Matching genres: {', '.join(breakdown['details']['genres'])}")
+        print(f"├─ Studio Score: {round(breakdown['studio_score'] * 100, 1)}%")
+        if breakdown['details']['studio']:
+            print(f"│  └─ Studio match: {breakdown['details']['studio']}")
+        print(f"├─ Actor Score: {round(breakdown['actor_score'] * 100, 1)}%")
+        if breakdown['details']['actors']:
+            print(f"│  └─ Matching actors: {', '.join(breakdown['details']['actors'])}")
+        print(f"├─ Language Score: {round(breakdown['language_score'] * 100, 1)}%")
+        if breakdown['details']['language']:
+            print(f"│  └─ Language match: {breakdown['details']['language']}")
+        print(f"└─ Keyword Score: {round(breakdown['keyword_score'] * 100, 1)}%")
+        if breakdown['details']['keywords']:
+            print(f"   └─ Matching keywords: {', '.join(breakdown['details']['keywords'])}")
+        print("")
     # ------------------------------------------------------------------------
     # GET RECOMMENDATIONS
     # ------------------------------------------------------------------------
@@ -1614,67 +1897,86 @@ class PlexTVRecommender:
             return []
 
     def get_recommendations(self) -> Dict[str, List[Dict]]:
+        if self.cached_watched_count > 0 and not self.watched_show_ids:
+            # Force refresh of watched data
+            if self.users['tautulli_users']:
+                self.watched_data = self._get_tautulli_watched_shows_data()
+            else:
+                self.watched_data = self._get_managed_users_watched_data()
+            self.watched_data_counters = self.watched_data
+            self._save_watched_cache()
+        """Get TV show recommendations based on watch history."""
         trakt_config = self.config.get('trakt', {})        
-        # Check if we need to clear Trakt history first
+        
+        # Handle Trakt operations if configured
         if trakt_config.get('clear_watch_history', False):
             self._clear_trakt_watch_history()
-        
-        # Then proceed with normal sync if enabled
         if self.sync_watch_history:
             self._sync_watched_shows_to_trakt()
             self._save_cache()
+    
+        # Get all shows from cache
+        all_shows = self.show_cache.cache['shows']
         
-        plex_recs = self.get_unwatched_library_shows()
-        if plex_recs:
-            excluded_recs = [s for s in plex_recs if any(g in self.exclude_genres for g in s['genres'])]
-            included_recs = [s for s in plex_recs if not any(g in self.exclude_genres for g in s['genres'])]
-    
-            print(f"Excluded {len(excluded_recs)} shows based on excluded genres.")
-    
-            if not included_recs:
-                print(f"{YELLOW}No unwatched shows left after applying genre exclusions.{RESET}")
-                plex_recs = []
-            else:
-                # Get shows section
-                shows_section = self.plex.library.section(self.library_title)
+        print(f"\n{YELLOW}Processing recommendations...{RESET}")
+        
+        # Filter out watched shows and excluded genres
+        unwatched_shows = []
+        excluded_count = 0
+        
+        for show_id, show_info in all_shows.items():
+            # Skip if show is watched
+            if int(str(show_id)) in self.watched_show_ids:
+                continue
                 
-                # Calculate similarity scores using actual Plex show objects
-                print(f"\n{YELLOW}Calculating similarity scores...{RESET}")
-                scored_shows = []
-                total_shows = len(included_recs)
+            # Skip if show has excluded genres
+            if any(g in self.exclude_genres for g in show_info.get('genres', [])):
+                excluded_count += 1
+                continue
                 
-                for i, show_info in enumerate(included_recs, 1):
-                    self._show_progress("Processing", i, total_shows)
-                    try:
-                        # Find the actual Plex show object
-                        plex_show = next(
-                            (s for s in shows_section.search(title=show_info['title'])
-                             if s.year == show_info.get('year')), 
-                            None
-                        )
-                        if plex_show:
-                            # Calculate score using the Plex show object
-                            similarity_score = self.calculate_show_score(plex_show)
-                            show_info['similarity_score'] = similarity_score
-                            scored_shows.append(show_info)
-                    except Exception as e:
-                        continue
+            unwatched_shows.append(show_info)
     
-                # Sort by similarity score
-                scored_shows.sort(key=lambda x: x['similarity_score'], reverse=True)
+        if excluded_count > 0:
+            print(f"Excluded {excluded_count} shows based on genre filters")
     
-                # Take top 20% of shows by similarity score
+        if not unwatched_shows:
+            print(f"{YELLOW}No unwatched shows found matching your criteria.{RESET}")
+            plex_recs = []
+        else:
+            print(f"Calculating similarity scores for {len(unwatched_shows)} shows...")
+            
+            # Calculate similarity scores
+            scored_shows = []
+            for i, show_info in enumerate(unwatched_shows, 1):
+                self._show_progress("Processing", i, len(unwatched_shows))
+                try:
+                    similarity_score, breakdown = self._calculate_similarity_from_cache(show_info)
+                    show_info['similarity_score'] = similarity_score
+                    show_info['score_breakdown'] = breakdown
+                    scored_shows.append(show_info)
+                except Exception as e:
+                    print(f"{YELLOW}Error processing {show_info['title']}: {e}{RESET}")
+                    continue
+            
+            # Sort by similarity score
+            scored_shows.sort(key=lambda x: x['similarity_score'], reverse=True)
+            
+            if self.randomize_recommendations:
+                # Take top 20% of shows by similarity score and randomize
                 top_count = max(int(len(scored_shows) * 0.2), self.limit_plex_results)
                 top_pool = scored_shows[:top_count]
+                plex_recs = random.sample(top_pool, min(self.limit_plex_results, len(top_pool)))
+            else:
+                # Take top shows directly by similarity score
+                plex_recs = scored_shows[:self.limit_plex_results]
+            
+            # Print detailed breakdowns for final recommendations if debug is enabled
+            if self.debug:
+                print(f"\n{GREEN}=== Similarity Score Breakdowns for Recommendations ==={RESET}")
+                for show in plex_recs:
+                    self._print_similarity_breakdown(show, show['similarity_score'], show['score_breakdown'])
     
-                # Randomly select from the top pool
-                if top_pool:
-                    plex_recs = random.sample(top_pool, min(self.limit_plex_results, len(top_pool)))
-                else:
-                    plex_recs = []
-        else:
-            plex_recs = []
-    
+        # Get Trakt recommendations if enabled
         trakt_recs = []
         if not self.plex_only:
             trakt_recs = self.get_trakt_recommendations()
@@ -1684,7 +1986,7 @@ class PlexTVRecommender:
             'plex_recommendations': plex_recs,
             'trakt_recommendations': trakt_recs
         }
-
+    
     def _user_select_recommendations(self, recommended_shows: List[Dict], operation_label: str) -> List[Dict]:
         prompt = (
             f"\nWhich recommendations would you like to {operation_label}?\n"
@@ -2092,7 +2394,11 @@ def format_show_output(show: Dict,
                       show_imdb_link: bool = False) -> str:
     bullet = f"{index}. " if index is not None else "- "
     output = f"{bullet}{CYAN}{show['title']}{RESET} ({show.get('year', 'N/A')})"
-    
+
+    if 'similarity_score' in show:
+        score_percentage = round(show['similarity_score'] * 100, 1)
+        output += f" - Similarity: {YELLOW}{score_percentage}%{RESET}"
+		
     if show.get('genres'):
         output += f"\n  {YELLOW}Genres:{RESET} {', '.join(show['genres'])}"
 
