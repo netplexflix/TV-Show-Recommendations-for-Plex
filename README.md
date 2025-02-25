@@ -1,6 +1,6 @@
 # 📺 TV Show Recommendations for Plex 🎯
 
-This script analyzes your Plex viewing patterns and suggests TV Shows you may enjoy, both from your existing unwatched library and from Trakt's recommendations.
+This script analyzes the Plex viewing patterns of yourself and/or selected users and suggests TV Shows you or your users may enjoy, both from your existing unwatched library and from Trakt's recommendations.
 It can then
 * label unwatched recommended TV Shows in Plex (to create a collection)
 * add new recommendations to Sonarr
@@ -19,7 +19,7 @@ Also check out [Movie Recommendations for Plex](https://github.com/netplexflix/M
 ---
 
 ## ✨ Features
-- 👥 **User Selection**: Analyze your own profile and/or that of selected users.
+- 👥 **User Selection**: Analyze your own profile and/or that of selected user(group)s.
 - 🧠 **Smart Recommendations**: Analyzes watch history to understand preferences
 - 🏷️ **Label Management**: Labels recommended shows in Plex
 - 🎯 **Sonarr Integration**: Adds external recommendations to your Sonarr wanted list
@@ -35,14 +35,11 @@ Also check out [Movie Recommendations for Plex](https://github.com/netplexflix/M
 ---
 ## 🧙‍♂️ How are recommendations picked?
 
-The script checks your Plex library for watched TV Shows and notes its characteristics, such as genre, studio, actors, rating, language, TMDB keywords, ...
-It keeps a frequency count of how often each of these characteristics were found to build a profile on what you like watching.
+The script checks your Plex library for watched movies and notes its characteristics, such as genres, director, actors, rating, language, plot keywords, themes, etc... It keeps a frequency count of how often each of these characteristics were found to build a profile on what you like watching. If you use Plex's user Ratings to rate your movies, the script will use these to better understand what you like or dislike.
 
-**For each unwatched Plex TV Show**, it calculates a similarity score based on how many of those familiar elements it shares with your watch history, giving extra weight to those you watch more frequently.
-It also factors in external ratings (e.g. IMDb), then randomly selects from the top matches to avoid repetitive lists.</br>
+**For each unwatched Plex TV Show**, it calculates a similarity score based on how many of those familiar elements it shares with your watch profile, giving extra weight to those you watch more frequently and rate highly.</br>
 
-**For suggestions outside your existing library**, the script uses your watch history to query Trakt for its built-in movie recommendations algorithm.
-It excludes any titles already in your Plex library or containing excluded genres and randomly samples from the top-rated portion of Trakt’s suggestions, ensuring variety across runs.
+**For suggestions outside your existing library**, the script uses your watch history to query Trakt for its built-in TV Show recommendations algorithm. It excludes any titles already in your Plex library or containing excluded genres and randomly samples from the top-rated portion of Trakt’s suggestions, ensuring variety across runs.
 
 ---
 
@@ -80,6 +77,8 @@ Rename `config.example.yml` to `config.yml` and set up your credentials and pref
 - **limit_plex_results:** Limit amount of recommended unwatched TV Shows from within your Plex library.
 - **limit_trakt_results:** Limit amount of recommended TV Shows from outside your Plex library.
 - **exclude_genre:** Genres to exclude. E.g. "animation, documentary".
+- **randomize_recommendations:** `true` will randomize recommendations from the top 10% matches to ensure variety across runs. `false` will order on similarity score.
+- **normalize_counters:** `true`will normalize counters to "nerf" outliers.
 - **show_summary:** `true` will show you a brief plot summary for each TV Show.
 - **show_cast:** `true` will show top 3 cast members.
 - **show_language:** `true` will show the main language.
@@ -149,9 +148,11 @@ paths:
 - **clear_watch_history:** `true` will erase your Trakt movie watch history (before syncing). This is recommended if you're doing multiple runs for different user(group)s.
 - **sync_watch_history:** Can be set to `false` if you already build your Trakt watch history another way (e.g.: through Trakt's Plex Scrobbler).
 
+> [!WARNING]
+> If you already have a populated Trakt account and want to analyze other users on your server, it is highly recommended to create a new Trakt account for use with this script. clear_watch_history needs to be enabled if you're doing runs for different users in order for Trakt to only take the relevant watch history of the given user into account. This will wipe ALL history first and then sync again. Any history you had on Trakt that came from outside of Plex will be gone forever.
+
 ### TMDB Settings
 - **api_key:** [How to get a TMDB API Key](https://developer.themoviedb.org/docs/getting-started)
-- **use_TMDB_keywords:** `true` uses TMDB (plot)keywords for matching (Recommended).
 
 ### Weights
 - Here you can change the 'weight' or 'importance' some parameters have. Make sure the sum of the weights adds up to 1.
