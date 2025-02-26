@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 import math
 import copy
 
-__version__ = "2.0b15"
+__version__ = "2.0b16"
 REPO_URL = "https://github.com/netplexflix/TV-Show-Recommendations-for-Plex"
 API_VERSION_URL = f"https://api.github.com/repos/netplexflix/TV-Show-Recommendations-for-Plex/releases/latest"
 
@@ -261,7 +261,7 @@ class ShowCache:
         self.cache['library_count'] = current_count
         self.cache['last_updated'] = datetime.now().isoformat()
         self._save_cache()
-        print(f"{GREEN}Show cache updated{RESET}")
+        print(f"\n{GREEN}Show cache updated{RESET}")
         return True
         
     def _save_cache(self):
@@ -1554,163 +1554,271 @@ class PlexTVRecommender:
     
         print(f"\n{YELLOW}Starting Trakt watch history sync...{RESET}")
         
+        # Load existing synced episode IDs from cache
+        previously_synced_ids = set()
+        if os.path.exists(self.trakt_sync_cache_path):
+            try:
+                with open(self.trakt_sync_cache_path, 'r') as f:
+                    cache_data = json.load(f)
+                    if 'synced_episode_ids' in cache_data:
+                        previously_synced_ids = set(int(id) for id in cache_data['synced_episode_ids'] if str(id).isdigit())
+                        print(f"Loaded {len(previously_synced_ids)} previously synced episode IDs from cache")
+            except Exception as e:
+                print(f"{YELLOW}Error loading Trakt sync cache: {e}{RESET}")
+        
         watched_episodes = []
         
-        if self.users['tautulli_users']:
-            # Get Tautulli history for watched episodes
-            user_ids = self._get_tautulli_user_ids()
-            for user_id in user_ids:
-                start = 0
-                while True:
-                    params = {
-                        'apikey': self.config['tautulli']['api_key'],
-                        'cmd': 'get_history',
-                        'media_type': 'episode',
-                        'user_id': user_id,
-                        'length': 1000
-                    }
-                    response = requests.get(f"{self.config['tautulli']['url']}/api/v2", params=params)
-                    data = response.json()['response']['data']
-                    
-                    if isinstance(data, dict):
-                        history_items = data.get('data', [])
-                    else:
-                        history_items = data
-                    
-                    for item in history_items:
-                        if item.get('watched_status') == 1:  # Only fully watched episodes
-                            try:
-                                # Convert timestamp
-                                timestamp = int(item['date'])
-                                watched_date = datetime.fromtimestamp(timestamp)
-                                trakt_date = watched_date.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        try:
+            if self.users['tautulli_users']:
+                # Get Tautulli history for watched episodes
+                user_ids = self._get_tautulli_user_ids()
+                
+                # First, get all watch history from Tautulli
+                all_history_items = []
+                for user_id in user_ids:
+                    start = 0
+                    while True:
+                        params = {
+                            'apikey': self.config['tautulli']['api_key'],
+                            'cmd': 'get_history',
+                            'media_type': 'episode',
+                            'user_id': user_id,
+                            'length': 1000,
+                            'start': start
+                        }
+                        
+                        try:
+                            response = requests.get(
+                                f"{self.config['tautulli']['url']}/api/v2", 
+                                params=params,
+                                timeout=30
+                            )
+                            
+                            response.raise_for_status()
+                            data = response.json()['response']['data']
+                            
+                            if isinstance(data, dict):
+                                history_items = data.get('data', [])
+                            else:
+                                history_items = data
+                            
+                            all_history_items.extend(history_items)
+                            
+                            # Check if we should continue to next page
+                            if len(history_items) < 1000:
+                                break
                                 
-                                # Get TVDB ID from Plex using rating_key
-                                episode = self.plex.fetchItem(int(item['rating_key']))
+                            start += len(history_items)
+                            
+                        except Exception as e:
+                            if self.debug:
+                                print(f"DEBUG: Error fetching Tautulli history: {e}")
+                            break
+                
+                print(f"Gathering episode data from {len(all_history_items)} history items...")
+                
+                # Group episodes by rating_key (episode ID)
+                episode_groups = {}
+                for item in all_history_items:
+                    if item.get('watched_status') == 1:
+                        key = item['rating_key']
+                        if key not in episode_groups:
+                            episode_groups[key] = item
+                        
+                # Process each unique episode with progress indicator
+                total_episodes = len(episode_groups)
+                for i, (key, item) in enumerate(episode_groups.items()):
+                    # Show progress every 10 episodes or for the first/last one
+                    if i == 0 or i == total_episodes-1 or (i+1) % 10 == 0:
+                        progress = int((i+1) / total_episodes * 100)
+                        sys.stdout.write(f"\rProcessing episodes: {i+1}/{total_episodes} ({progress}%)")
+                        sys.stdout.flush()
+                        
+                    try:
+                        # Get the actual episode from Plex to ensure correct TVDB ID
+                        episode = self.plex.fetchItem(int(key))
+                        
+                        # Extract TVDB ID directly from the episode's GUIDs
+                        tvdb_id = None
+                        if hasattr(episode, 'guids'):
+                            for guid in episode.guids:
+                                if 'tvdb://' in guid.id:
+                                    try:
+                                        # Extract the actual episode TVDB ID
+                                        tvdb_id = int(guid.id.split('tvdb://')[1].split('?')[0])
+                                        break
+                                    except (ValueError, IndexError):
+                                        continue
+                        
+                        if not tvdb_id:
+                            continue
+                        
+                        # Convert timestamp
+                        timestamp = int(item['date'])
+                        watched_date = datetime.fromtimestamp(timestamp)
+                        trakt_date = watched_date.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                        
+                        watched_episodes.append({
+                            'tvdb_id': tvdb_id,
+                            'show_title': item['grandparent_title'],
+                            'season': item['parent_media_index'],
+                            'episode': item['media_index'],
+                            'watched_at': trakt_date
+                        })
+                            
+                    except Exception as e:
+                        if self.debug:
+                            print(f"\nDEBUG: Error processing episode {item.get('full_title', 'Unknown')}: {e}")
+                        continue
+                
+                # Print newline after progress indicator
+                print("")
+                
+            else:
+                # Process each show's episodes with progress
+                print(f"Gathering episode data from {len(self.watched_show_ids)} watched shows...")
+                total_shows = len(self.watched_show_ids)
+                show_count = 0
+                episode_count = 0
+                
+                for show_id in self.watched_show_ids:
+                    show_count += 1
+                    try:
+                        show = self.plex.fetchItem(show_id)
+                        show_episodes = [ep for ep in show.episodes() if ep.isWatched]
+                        
+                        # Update progress
+                        progress = int(show_count / total_shows * 100)
+                        sys.stdout.write(f"\rProcessing shows: {show_count}/{total_shows} ({progress}%) - Found {episode_count} episodes")
+                        sys.stdout.flush()
+                        
+                        for episode in show_episodes:
+                            if hasattr(episode, 'guids'):
+                                # Extract TVDB ID directly from the episode's GUIDs
                                 tvdb_id = None
-                                if hasattr(episode, 'guids'):
-                                    for guid in episode.guids:
-                                        if 'tvdb://' in guid.id:
+                                for guid in episode.guids:
+                                    if 'tvdb://' in guid.id:
+                                        try:
                                             tvdb_id = int(guid.id.split('tvdb://')[1].split('?')[0])
                                             break
+                                        except (ValueError, IndexError):
+                                            continue
                                 
-                                if tvdb_id:
-                                    watched_episodes.append({
-                                        'tvdb_id': tvdb_id,
-                                        'show_title': item['grandparent_title'],
-                                        'season': item['parent_media_index'],
-                                        'episode': item['media_index'],
-                                        'watched_at': trakt_date
-                                    })
+                                if not tvdb_id:
+                                    continue
                                     
-                            except Exception as e:
-                                print(f"{YELLOW}Error processing Tautulli history item: {e}{RESET}")
-                                continue
-                            
-                    if len(history_items) < 1000:
-                        break
-                    start += len(history_items)
-        else:
-            # Get Plex history for watched episodes
-            for show_id in self.watched_show_ids:
-                show = self.plex.fetchItem(show_id)
-                for episode in show.episodes():
-                    if episode.isWatched and hasattr(episode, 'guids'):
-                        tvdb_id = None
-                        for guid in episode.guids:
-                            if 'tvdb://' in guid.id:
-                                tvdb_id = int(guid.id.split('tvdb://')[1].split('?')[0])
-                                break
-                        
-                        if tvdb_id:
-                            watched_at = None
-                            if hasattr(episode, 'lastViewedAt'):
-                                if isinstance(episode.lastViewedAt, datetime):
-                                    watched_at = episode.lastViewedAt
-                                else:
-                                    watched_at = datetime.fromtimestamp(int(episode.lastViewedAt))
-                            
-                            watched_episodes.append({
-                                'tvdb_id': tvdb_id,
-                                'show_title': show.title,
-                                'season': episode.seasonNumber,
-                                'episode': episode.index,
-                                'watched_at': watched_at.strftime("%Y-%m-%dT%H:%M:%S.000Z") if watched_at else None
-                            })
-    
-        if not watched_episodes:
-            print(f"{YELLOW}No episodes found to sync to Trakt{RESET}")
-            return
-    
-#        # Show preview
-#        print(f"\nFound {len(watched_episodes)} episodes to sync:")
-#        for ep in watched_episodes[:5]:
-#            print(f"- {ep['show_title']} S{ep['season']:02d}E{ep['episode']:02d} "
-#                  f"[TVDB: {ep['tvdb_id']}] (watched: {ep['watched_at']})")
-#        if len(watched_episodes) > 5:
-#            print(f"... and {len(watched_episodes) - 5} more episodes")
-#    
-#        if self.confirm_operations:
-#            choice = input("\nProceed with Trakt sync? (y/n): ").lower()
-#            if choice not in ['y', 'yes']:
-#                print("Sync cancelled by user")
-#                return
-    
-        # Sync in batches
-        batch_size = 100
-        newly_synced = set()
-        
-        for i in range(0, len(watched_episodes), batch_size):
-            batch = watched_episodes[i:i+batch_size]
-            
-            payload = {
-                "episodes": [
-                    {
-                        "ids": {
-                            "tvdb": ep['tvdb_id']
-                        },
-                        "watched_at": ep['watched_at']
-                    }
-                    for ep in batch
-                ]
-            }
-    
-            try:
-                response = requests.post(
-                    "https://api.trakt.tv/sync/history",
-                    headers=self.trakt_headers,
-                    json=payload
-                )
+                                watched_at = None
+                                if hasattr(episode, 'lastViewedAt'):
+                                    if isinstance(episode.lastViewedAt, datetime):
+                                        watched_at = episode.lastViewedAt
+                                    else:
+                                        watched_at = datetime.fromtimestamp(int(episode.lastViewedAt))
                                 
-                if response.status_code == 201:
-                    response_data = response.json()
-                    added_episodes = response_data.get('added', {}).get('episodes', 0)
-                    if added_episodes > 0:
-                        newly_synced.update(ep['tvdb_id'] for ep in batch)
-                        print(f"{GREEN}Successfully synced {added_episodes} episodes{RESET}")
+                                if not watched_at:
+                                    continue
+                                    
+                                watched_episodes.append({
+                                    'tvdb_id': tvdb_id,
+                                    'show_title': show.title,
+                                    'season': episode.seasonNumber,
+                                    'episode': episode.index,
+                                    'watched_at': watched_at.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                                })
+                                episode_count += 1
+                                
+                    except Exception as e:
+                        if self.debug:
+                            print(f"\nDEBUG: Error processing show {show_id}: {e}")
+                        continue
+                
+                # Print newline after progress indicator
+                print("")
+        
+            if not watched_episodes:
+                print(f"{YELLOW}No episodes found to sync to Trakt{RESET}")
+                return
+            
+            # Filter out already synced episodes
+            new_episodes = []
+            for episode in watched_episodes:
+                if episode['tvdb_id'] not in previously_synced_ids:
+                    new_episodes.append(episode)
+            
+            if not new_episodes:
+                print(f"{GREEN}All {len(watched_episodes)} episodes already synced to Trakt{RESET}")
+                return
+            
+            print(f"Found {len(new_episodes)} new episodes to sync (out of {len(watched_episodes)} total)")
+            
+            # Sync only new episodes in batches
+            batch_size = 100
+            newly_synced = set()
+            batch_count = 0
+            total_batches = math.ceil(len(new_episodes) / batch_size)
+            
+            for i in range(0, len(new_episodes), batch_size):
+                batch_count += 1
+                batch = new_episodes[i:i+batch_size]
+                
+                # Show batch progress
+                print(f"Syncing batch {batch_count}/{total_batches} ({len(batch)} episodes)...")
+                
+                payload = {
+                    "episodes": [
+                        {
+                            "ids": {
+                                "tvdb": ep['tvdb_id']
+                            },
+                            "watched_at": ep['watched_at']
+                        }
+                        for ep in batch
+                    ]
+                }
+        
+                try:
+                    response = requests.post(
+                        "https://api.trakt.tv/sync/history",
+                        headers=self.trakt_headers,
+                        json=payload,
+                        timeout=60
+                    )
+                                    
+                    if response.status_code == 201:
+                        response_data = response.json()
+                        added_episodes = response_data.get('added', {}).get('episodes', 0)
+                        if added_episodes > 0:
+                            newly_synced.update(ep['tvdb_id'] for ep in batch)
+                            print(f"{GREEN}Successfully synced {added_episodes} episodes{RESET}")
+                        else:
+                            print(f"{YELLOW}Warning: No episodes were added in this batch{RESET}")
                     else:
-                        print(f"{YELLOW}Warning: No episodes were added in this batch{RESET}")
-                else:
-                    print(f"{RED}Error syncing batch to Trakt: {response.status_code}{RESET}")
-                    print(f"Error response: {response.text}")
-    
-                time.sleep(1)  # Respect rate limiting
-    
-            except Exception as e:
-                print(f"{RED}Error during Trakt sync: {e}{RESET}")
-                continue
-    
-        # Update and save Trakt sync cache
-        if newly_synced:
-            try:
-                with open(self.trakt_sync_cache_path, 'w') as f:
-                    json.dump({
-                        'synced_episode_ids': list(newly_synced),
-                        'last_sync': datetime.now().isoformat()
-                    }, f, indent=4)
-                print(f"Successfully synced {len(newly_synced)} episodes to Trakt")
-            except Exception as e:
-                print(f"{RED}Error saving Trakt sync cache: {e}{RESET}")
+                        print(f"{RED}Error syncing batch to Trakt: {response.status_code}{RESET}")
+                        print(f"Error response: {response.text}")
+        
+                    time.sleep(2)  # Respect rate limiting
+        
+                except Exception as e:
+                    print(f"{RED}Error during Trakt sync: {e}{RESET}")
+                    time.sleep(2)
+                    continue
+        
+            # Update and save Trakt sync cache - combine previously synced with newly synced
+            if newly_synced:
+                try:
+                    all_synced = previously_synced_ids.union(newly_synced)
+                    with open(self.trakt_sync_cache_path, 'w') as f:
+                        json.dump({
+                            'synced_episode_ids': list(all_synced),
+                            'last_sync': datetime.now().isoformat()
+                        }, f, indent=4)
+                    print(f"Successfully synced {len(newly_synced)} new episodes to Trakt (total synced: {len(all_synced)})")
+                except Exception as e:
+                    print(f"{RED}Error saving Trakt sync cache: {e}{RESET}")
+        except Exception as outer_e:
+            print(f"{RED}Unexpected error during Trakt sync process: {outer_e}{RESET}")
+            if self.debug:
+                import traceback
+                print(f"DEBUG: {traceback.format_exc()}")
     # ------------------------------------------------------------------------
     # CALCULATE SCORES
     # ------------------------------------------------------------------------
