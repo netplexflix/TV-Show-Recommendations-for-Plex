@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 import math
 import copy
 
-__version__ = "2.0b17"
+__version__ = "2.0b18"
 REPO_URL = "https://github.com/netplexflix/TV-Show-Recommendations-for-Plex"
 API_VERSION_URL = f"https://api.github.com/repos/netplexflix/TV-Show-Recommendations-for-Plex/releases/latest"
 
@@ -574,18 +574,18 @@ class PlexTVRecommender:
         # User validation logic
         all_users = account.users()
         all_usernames_lower = {u.title.lower(): u.title for u in all_users}
-    
+        all_usernames_lower['admin'] = admin_user  # Add admin mapping explicitly
+        all_usernames_lower['administrator'] = admin_user  # Add administrator mapping explicitly
+        
         processed_managed = []
         for user in managed_users:
             user_lower = user.lower()
-            if user_lower in ['admin', 'administrator']:
-                processed_managed.append(admin_user)
-            elif user_lower in all_usernames_lower:
+            if user_lower in all_usernames_lower:
                 processed_managed.append(all_usernames_lower[user_lower])
             else:
                 print(f"{RED}Error: Managed user '{user}' not found{RESET}")
                 raise ValueError(f"User '{user}' not found in Plex account")
-    
+        
         # Remove duplicates while preserving order
         seen = set()
         managed_users = [u for u in processed_managed if not (u in seen or seen.add(u))]
@@ -2763,14 +2763,26 @@ def main():
             
             # Create modified config for this user
             user_config = copy.deepcopy(base_config)
+            
+            # Resolve Admin to actual username if needed
+            resolved_user = user
+            try:
+                account = MyPlexAccount(token=base_config['plex']['token'])
+                admin_username = account.username
+                if user.lower() in ['admin', 'administrator']:
+                    resolved_user = admin_username
+                    print(f"{YELLOW}Resolved Admin to: {admin_username}{RESET}")
+            except Exception as e:
+                print(f"{YELLOW}Could not resolve admin username: {e}{RESET}")
+            
             if 'managed_users' in user_config['plex']:
-                user_config['plex']['managed_users'] = user
+                user_config['plex']['managed_users'] = resolved_user
             elif 'users' in user_config.get('tautulli', {}):
-                user_config['tautulli']['users'] = [user]
+                user_config['tautulli']['users'] = [resolved_user]
             
             # Process recommendations for this user
-            process_recommendations(user_config, config_path, keep_logs, single_user=user)
-            print(f"\n{GREEN}Completed processing for user: {user}{RESET}")
+            process_recommendations(user_config, config_path, keep_logs, single_user=resolved_user)
+            print(f"\n{GREEN}Completed processing for user: {resolved_user}{RESET}")
             print("-" * 50)
 
     runtime = datetime.now() - start_time
