@@ -138,6 +138,7 @@ paths:
 - **api_key:** Can be found in Sonarr under Settings => General => Security
 - **root_folder:** Change to your TV Show root folder
 - **add_to_sonarr:** Set to `true` if you want to add Trakt recommendations to Sonarr. (Requires `plex_only:` `false`)
+- **seasonFolder:** `true` will enable season folders when adding a show
 - **monitor:** `true` will add TV Shows as monitored and trigger a search. `false` will add them unmonitored without searching.
 - **monitor_option:** `all`, `none` or `firstSeason`
 - **search_missing:** `true` triggers a search after adding a TV show
