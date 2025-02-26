@@ -33,6 +33,7 @@ sonarr:
   api_key: YOUR_SONARR_API_KEY
   root_folder: P:\TV
   add_to_sonarr: true
+  seasonFolder: true
   monitor: true
   monitor_option: none #all, none or firstSeason
   search_missing: true
