@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 import math
 import copy
 
-__version__ = "2.0b14"
+__version__ = "2.0b15"
 REPO_URL = "https://github.com/netplexflix/TV-Show-Recommendations-for-Plex"
 API_VERSION_URL = f"https://api.github.com/repos/netplexflix/TV-Show-Recommendations-for-Plex/releases/latest"
 
@@ -146,6 +146,10 @@ class ShowCache:
                 try:
                     show.reload()
                     
+                    # Add delay between shows
+                    if i > 1 and tmdb_api_key:
+                        time.sleep(0.5)  # Basic rate limiting
+                    
                     imdb_id = None
                     tmdb_id = None
                     if hasattr(show, 'guids'):
@@ -158,56 +162,83 @@ class ShowCache:
                                 except (ValueError, IndexError):
                                     pass
                     
+                    # TMDB ID search with retries
                     if not tmdb_id and tmdb_api_key:
-                        try:
-                            params = {
-                                'api_key': tmdb_api_key,
-                                'query': show.title,
-                                'first_air_date_year': getattr(show, 'year', None)
-                            }
-                            resp = requests.get(
-                                "https://api.themoviedb.org/3/search/tv",
-                                params=params,
-                                timeout=10
-                            )
-                            if resp.status_code == 200:
-                                results = resp.json().get('results', [])
-                                if results:
-                                    tmdb_id = results[0]['id']
-                        except Exception as e:
-                            print(f"{YELLOW}Error getting TMDB ID for {show.title}: {e}{RESET}")
-                    
+                        max_retries = 3
+                        for attempt in range(max_retries):
+                            try:
+                                params = {
+                                    'api_key': tmdb_api_key,
+                                    'query': show.title,
+                                    'first_air_date_year': getattr(show, 'year', None)
+                                }
+                                resp = requests.get(
+                                    "https://api.themoviedb.org/3/search/tv",
+                                    params=params,
+                                    timeout=15
+                                )
+                                
+                                if resp.status_code == 429:
+                                    sleep_time = 2 * (attempt + 1)
+                                    print(f"{YELLOW}TMDB rate limit hit, waiting {sleep_time}s...{RESET}")
+                                    time.sleep(sleep_time)
+                                    continue
+                                    
+                                if resp.status_code == 200:
+                                    results = resp.json().get('results', [])
+                                    if results:
+                                        tmdb_id = results[0]['id']
+                                    break
+                                    
+                            except (requests.exceptions.ConnectionError, 
+                                   requests.exceptions.Timeout,
+                                   requests.exceptions.ChunkedEncodingError) as e:
+                                print(f"{YELLOW}Connection error, retrying... ({attempt+1}/{max_retries}){RESET}")
+                                time.sleep(1)
+                                if attempt == max_retries - 1:
+                                    print(f"{YELLOW}Failed to get TMDB ID for {show.title} after {max_retries} tries{RESET}")
+                            except Exception as e:
+                                print(f"{YELLOW}Error getting TMDB ID for {show.title}: {e}{RESET}")
+                                break
+    
                     tmdb_keywords = []
                     if tmdb_id and tmdb_api_key:
-                        # Store in both the show info and the recommender's caches
-                        if self.recommender:
-                            if self.recommender.debug:
-                                print(f"DEBUG: Found TMDB ID {tmdb_id} for show {show.title}")
-                            self.recommender.plex_tmdb_cache[str(show.ratingKey)] = tmdb_id
-                        
-                        # Get and store keywords
-                        try:
-                            kw_resp = requests.get(
-                                f"https://api.themoviedb.org/3/tv/{tmdb_id}/keywords",
-                                params={'api_key': tmdb_api_key}
-                            )
-                            if kw_resp.status_code == 200:
-                                keywords = kw_resp.json().get('results', [])
-                                tmdb_keywords = [k['name'].lower() for k in keywords]
-                                if self.recommender:
-                                    if self.recommender.debug:
-                                        print(f"DEBUG: Found {len(tmdb_keywords)} keywords for show {show.title}")
-                                    self.recommender.tmdb_keywords_cache[str(tmdb_id)] = tmdb_keywords
-                        except Exception as e:
-                            print(f"{YELLOW}Error getting TMDB keywords for {show.title}: {e}{RESET}")
-                    
+                        max_retries = 3
+                        for attempt in range(max_retries):
+                            try:
+                                kw_resp = requests.get(
+                                    f"https://api.themoviedb.org/3/tv/{tmdb_id}/keywords",
+                                    params={'api_key': tmdb_api_key},
+                                    timeout=15
+                                )
+                                
+                                if kw_resp.status_code == 429:
+                                    sleep_time = 2 * (attempt + 1)
+                                    print(f"{YELLOW}TMDB rate limit hit, waiting {sleep_time}s...{RESET}")
+                                    time.sleep(sleep_time)
+                                    continue
+                                    
+                                if kw_resp.status_code == 200:
+                                    keywords = kw_resp.json().get('results', [])
+                                    tmdb_keywords = [k['name'].lower() for k in keywords]
+                                    break
+                                    
+                            except (requests.exceptions.ConnectionError,
+                                   requests.exceptions.Timeout,
+                                   requests.exceptions.ChunkedEncodingError) as e:
+                                print(f"{YELLOW}Connection error, retrying... ({attempt+1}/{max_retries}){RESET}")
+                                time.sleep(1)
+                                if attempt == max_retries - 1:
+                                    print(f"{YELLOW}Failed to get keywords for {show.title} after {max_retries} tries{RESET}")
+                            except Exception as e:
+                                print(f"{YELLOW}Error getting TMDB keywords for {show.title}: {e}{RESET}")
+                                break
+    
                     # Store in recommender's caches if available
                     if self.recommender and tmdb_id:
                         self.recommender.plex_tmdb_cache[str(show.ratingKey)] = tmdb_id
                         if tmdb_keywords:
                             self.recommender.tmdb_keywords_cache[str(tmdb_id)] = tmdb_keywords
-                        if self.recommender.debug:
-                            print(f"DEBUG: Added TMDB ID {tmdb_id} and {len(tmdb_keywords)} keywords for {show.title}")
                     
                     show_info = {
                         'title': show.title,
@@ -308,6 +339,8 @@ class PlexTVRecommender:
         print("Connecting to Plex server...")
         self.plex = self._init_plex()
         print(f"Connected to Plex successfully!\n")
+        general_config = self.config.get('general', {})
+        self.debug = general_config.get('debug', False)
         print(f"{YELLOW}Checking Cache...{RESET}")	
         tmdb_config = self.config.get('TMDB', {})
         self.use_tmdb_keywords = tmdb_config.get('use_TMDB_keywords', True)
@@ -317,8 +350,7 @@ class PlexTVRecommender:
         os.makedirs(self.cache_dir, exist_ok=True)
         self.show_cache = ShowCache(self.cache_dir, recommender=self)
         self.show_cache.update_cache(self.plex, self.library_title, self.tmdb_api_key)
-			
-        general_config = self.config.get('general', {})
+
         self.confirm_operations = general_config.get('confirm_operations', False)
         self.limit_plex_results = general_config.get('limit_plex_results', 10)
         self.limit_trakt_results = general_config.get('limit_trakt_results', 10)
@@ -331,7 +363,6 @@ class PlexTVRecommender:
         self.show_language = general_config.get('show_language', False)
         self.show_rating = general_config.get('show_rating', False)
         self.show_imdb_link = general_config.get('show_imdb_link', False)
-        self.debug = general_config.get('debug', False)
         
         exclude_genre_str = general_config.get('exclude_genre', '')
         self.exclude_genres = [g.strip().lower() for g in exclude_genre_str.split(',') if g.strip()] if exclude_genre_str else []
