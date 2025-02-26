@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 import math
 import copy
 
-__version__ = "2.0b18"
+__version__ = "2.0b19"
 REPO_URL = "https://github.com/netplexflix/TV-Show-Recommendations-for-Plex"
 API_VERSION_URL = f"https://api.github.com/repos/netplexflix/TV-Show-Recommendations-for-Plex/releases/latest"
 
@@ -574,13 +574,18 @@ class PlexTVRecommender:
         # User validation logic
         all_users = account.users()
         all_usernames_lower = {u.title.lower(): u.title for u in all_users}
-        all_usernames_lower['admin'] = admin_user  # Add admin mapping explicitly
-        all_usernames_lower['administrator'] = admin_user  # Add administrator mapping explicitly
         
         processed_managed = []
         for user in managed_users:
             user_lower = user.lower()
-            if user_lower in all_usernames_lower:
+            if user_lower in ['admin', 'administrator']:
+                # Special case for admin keywords
+                processed_managed.append(admin_user)
+            elif user_lower == admin_user.lower():
+                # Direct match with admin username (case-insensitive)
+                processed_managed.append(admin_user)
+            elif user_lower in all_usernames_lower:
+                # Match with shared users
                 processed_managed.append(all_usernames_lower[user_lower])
             else:
                 print(f"{RED}Error: Managed user '{user}' not found{RESET}")
@@ -2326,6 +2331,7 @@ class PlexTVRecommender:
         valid_options = ['all', 'none', 'firstSeason']
         monitor_option = self.sonarr_config.get('monitor_option', 'all')
         search_missing = self.sonarr_config.get('search_missing', False)
+        season_folder = self.sonarr_config.get('seasonFolder', True)
         
         if monitor_option not in valid_options:
             print(f"{RED}Invalid monitor_option '{monitor_option}'. Using 'all'{RESET}")
@@ -2569,7 +2575,7 @@ class PlexTVRecommender:
                         'tvdbId': tvdb_id,
                         'title': show['title'],
                         'qualityProfileId': quality_profile_id,
-                        'seasonFolder': True,
+                        'seasonFolder': season_folder,
                         'rootFolderPath': root_folder,
                         'monitored': True,
                         'addOptions': {
