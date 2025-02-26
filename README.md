@@ -144,6 +144,7 @@ paths:
 - **search_missing:** `true` triggers a search after adding a TV show
 - **quality_profile:** Name of the quality profile to be used when adding TV Shows
 - **sonarr_tag:** Add a Sonarr tag to added TV Shows
+- **append_usernames:** `true` appends the username(s) to the sonarr_tag
  
 ### Trakt
 - Your Trakt API credentials can be found in Trakt under settings => [Your Trakt Apps](https://trakt.tv/oauth/applications) [More info here](https://trakt.docs.apiary.io/#)
