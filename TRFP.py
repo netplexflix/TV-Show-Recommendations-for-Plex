@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 import math
 import copy
 
-__version__ = "2.0b19"
+__version__ = "2.0b20"
 REPO_URL = "https://github.com/netplexflix/TV-Show-Recommendations-for-Plex"
 API_VERSION_URL = f"https://api.github.com/repos/netplexflix/TV-Show-Recommendations-for-Plex/releases/latest"
 
@@ -2381,20 +2381,44 @@ class PlexTVRecommender:
     
             tag_id = None
             if self.sonarr_config.get('sonarr_tag'):
+                # Get the base tag name
+                tag_name = self.sonarr_config['sonarr_tag']
+                
+                # Handle username appending for Sonarr tags if enabled
+                if self.sonarr_config.get('append_usernames', False):
+                    if self.single_user:
+                        # For single user mode, only append the current user
+                        user_suffix = re.sub(r'\W+', '_', self.single_user.strip())
+                        tag_name = f"{tag_name}_{user_suffix}"
+                    else:
+                        # For combined mode, append all users
+                        users = []
+                        if self.users['tautulli_users']:
+                            users = self.users['tautulli_users']
+                        else:
+                            users = self.users['managed_users']
+                        
+                        if users:
+                            sanitized_users = [re.sub(r'\W+', '_', user.strip()) for user in users]
+                            user_suffix = '_'.join(sanitized_users)
+                            tag_name = f"{tag_name}_{user_suffix}"
+                
+                # Get or create the tag in Sonarr
                 tags_response = requests.get(f"{sonarr_url}/tag", headers=headers)
                 tags_response.raise_for_status()
                 tags = tags_response.json()
-                tag = next((t for t in tags if t['label'].lower() == self.sonarr_config['sonarr_tag'].lower()), None)
+                tag = next((t for t in tags if t['label'].lower() == tag_name.lower()), None)
                 if tag:
                     tag_id = tag['id']
                 else:
                     tag_response = requests.post(
                         f"{sonarr_url}/tag",
                         headers=headers,
-                        json={'label': self.sonarr_config['sonarr_tag']}
+                        json={'label': tag_name}
                     )
                     tag_response.raise_for_status()
                     tag_id = tag_response.json()['id']
+                    print(f"{GREEN}Created new Sonarr tag: {tag_name}{RESET}")
     
             profiles_response = requests.get(f"{sonarr_url}/qualityprofile", headers=headers)
             profiles_response.raise_for_status()

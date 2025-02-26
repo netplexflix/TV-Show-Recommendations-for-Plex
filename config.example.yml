@@ -39,6 +39,7 @@ sonarr:
   search_missing: true
   quality_profile: HD-1080p
   sonarr_tag: RecommendForPlex
+  append_usernames: true
 
 tautulli:
   api_key: YOUR_TAUTULLI_API_KEY
