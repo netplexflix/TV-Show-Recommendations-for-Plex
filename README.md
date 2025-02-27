@@ -10,7 +10,7 @@ Requires:
 - [TMDB API key](https://developer.themoviedb.org/docs/getting-started)
 
 Optionally requires:
-- [Trakt API key](https://trakt.docs.apiary.io/#) (for movie suggestions outside of your existing library)
+- [Trakt API key](https://trakt.docs.apiary.io/#) (for TV Show suggestions outside of your existing library)
 - [Sonarr](https://sonarr.tv/) (for adding new recommendations)
 - [Tautulli](https://tautulli.com/) (for fetching external users' watch history)
 
@@ -35,7 +35,7 @@ Also check out [Movie Recommendations for Plex](https://github.com/netplexflix/M
 ---
 ## 🧙‍♂️ How are recommendations picked?
 
-The script checks your Plex library for watched movies and notes its characteristics, such as genres, director, actors, rating, language, plot keywords, themes, etc... It keeps a frequency count of how often each of these characteristics were found to build a profile on what you like watching. If you use Plex's user Ratings to rate your movies, the script will use these to better understand what you like or dislike.
+The script checks your Plex library for watched TV Shows and notes its characteristics, such as genres, director, actors, rating, language, plot keywords, themes, etc... It keeps a frequency count of how often each of these characteristics were found to build a profile on what you like watching. If you use Plex's user Ratings to rate your TV Shows, the script will use these to better understand what you like or dislike.
 
 **For each unwatched Plex TV Show**, it calculates a similarity score based on how many of those familiar elements it shares with your watch profile, giving extra weight to those you watch more frequently and rate highly.</br>
 
