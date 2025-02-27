@@ -10,7 +10,7 @@ Requires:
 - [TMDB API key](https://developer.themoviedb.org/docs/getting-started)
 
 Optionally requires:
-- [Trakt API key](https://trakt.docs.apiary.io/#) (for movie suggestions outside of your existing library)
+- [Trakt API key](https://trakt.docs.apiary.io/#) (for TV Show suggestions outside of your existing library)
 - [Sonarr](https://sonarr.tv/) (for adding new recommendations)
 
 
@@ -39,7 +39,7 @@ It keeps a frequency count of how often each of these characteristics were found
 **For each unwatched Plex TV Show**, it calculates a similarity score based on how many of those familiar elements it shares with your watch history, giving extra weight to those you watch more frequently.
 It also factors in external ratings (e.g. IMDb), then randomly selects from the top matches to avoid repetitive lists.</br>
 
-**For suggestions outside your existing library**, the script uses your watch history to query Trakt for its built-in movie recommendations algorithm.
+**For suggestions outside your existing library**, the script uses your watch history to query Trakt for its built-in recommendations algorithm.
 It excludes any titles already in your Plex library or containing excluded genres and randomly samples from the top-rated portion of Trakt’s suggestions, ensuring variety across runs.
 
 ---
@@ -50,7 +50,7 @@ It excludes any titles already in your Plex library or containing excluded genre
 Clone the repository:
 ```sh
 git clone https://github.com/netplexflix/TV-Show-Recommendations-for-Plex.git
-cd Movie-Recommendations-for-Plex
+cd TV-Show-Recommendations-for-Plex
 ```
 
 ![#c5f015](https://placehold.co/15x15/c5f015/c5f015.png) Or simply download by pressing the green 'Code' button above and then 'Download Zip'.
