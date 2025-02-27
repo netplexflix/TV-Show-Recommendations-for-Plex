@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 import math
 import copy
 
-__version__ = "2.0b20"
+__version__ = "2.0b21"
 REPO_URL = "https://github.com/netplexflix/TV-Show-Recommendations-for-Plex"
 API_VERSION_URL = f"https://api.github.com/repos/netplexflix/TV-Show-Recommendations-for-Plex/releases/latest"
 
@@ -2119,14 +2119,16 @@ class PlexTVRecommender:
                 self.watched_data = self._get_managed_users_watched_data()
             self.watched_data_counters = self.watched_data
             self._save_watched_cache()
+        
         trakt_config = self.config.get('trakt', {})        
         
-        # Handle Trakt operations if configured
-        if trakt_config.get('clear_watch_history', False):
-            self._clear_trakt_watch_history()
-        if self.sync_watch_history:
-            self._sync_watched_shows_to_trakt()
-            self._save_cache()
+        # Handle Trakt operations if configured AND plex_only is not enabled
+        if not self.plex_only:
+            if trakt_config.get('clear_watch_history', False):
+                self._clear_trakt_watch_history()
+            if self.sync_watch_history:
+                self._sync_watched_shows_to_trakt()
+                self._save_cache()
     
         # Get all shows from cache
         all_shows = self.show_cache.cache['shows']
