@@ -148,7 +148,7 @@ paths:
  
 ### Trakt
 - Your Trakt API credentials can be found in Trakt under settings => [Your Trakt Apps](https://trakt.tv/oauth/applications) [More info here](https://trakt.docs.apiary.io/#)
-- **clear_watch_history:** `true` will erase your Trakt movie watch history (before syncing). This is recommended if you're doing multiple runs for different user(group)s.
+- **clear_watch_history:** `true` will erase your Trakt TV Show watch history (before syncing). This is recommended if you're doing multiple runs for different user(group)s.
 - **sync_watch_history:** Can be set to `false` if you already build your Trakt watch history another way (e.g.: through Trakt's Plex Scrobbler).
 
 > [!WARNING]
