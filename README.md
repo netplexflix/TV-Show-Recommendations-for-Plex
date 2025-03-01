@@ -39,7 +39,8 @@ The script checks your Plex library for watched TV Shows and notes its character
 
 **For each unwatched Plex TV Show**, it calculates a similarity score based on how many of those familiar elements it shares with your watch profile, giving extra weight to those you watch more frequently and rate highly.</br>
 
-**For suggestions outside your existing library**, the script uses your watch history to query Trakt for its built-in TV Show recommendations algorithm. It excludes any titles already in your Plex library or containing excluded genres and randomly samples from the top-rated portion of Trakt’s suggestions, ensuring variety across runs.
+**For suggestions outside your existing library**, the script uses your watch history to query Trakt for its built-in recommendations algorithm.
+It excludes any titles already in your Plex library or containing excluded genres and randomly samples from the top-rated portion of Trakt’s suggestions, ensuring variety across runs.
 
 ---
 
