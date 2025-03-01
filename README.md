@@ -2,8 +2,10 @@
 
 This script analyzes the Plex viewing patterns of yourself and/or selected users and suggests TV Shows you or your users may enjoy, both from your existing unwatched library and from Trakt's recommendations.
 It can then
-* label unwatched recommended TV Shows in Plex (to create a collection)
+* label unwatched recommended TV Shows in Plex (to create a "what should I watch?" collection tailered to your chosen users' profile)
 * add new recommendations to Sonarr
+
+The script can be run attended (requiring user confirmation) or unattended (fully automatic)
 
 Requires:
 - [Plex](https://www.plex.tv/)
@@ -27,7 +29,7 @@ Also check out [Movie Recommendations for Plex](https://github.com/netplexflix/M
 - 🔍 **Genre Filtering**: Excludes unwanted genres from recommendations
 - 🛠️ **Customizable**: Choose which parameters matter to you
 - 📊 **Rating Multipliers**: Uses User ratings (if present) to improve user profile
-- ☑️ **Trakt Integration**: Uploads your Plex watch history to Trakt if needed and gets personalized recommendations
+- ☑️ **Trakt Integration**: Uploads Plex watch history to Trakt if needed and gets personalized recommendations
 - 🗃️ **Caching**: Keeps a cache of operations to speed up subsequent runs, limit API calls, and avoid duplicates while syncing
 - 💾 **Path Mapping**: Supports different system configurations (NAS, Linux, Windows)
 - 📒 **Logging**: Keep desired amount of run logs
@@ -79,7 +81,7 @@ Rename `config.example.yml` to `config.yml` and set up your credentials and pref
 - **limit_plex_results:** Limit amount of recommended unwatched TV Shows from within your Plex library.
 - **limit_trakt_results:** Limit amount of recommended TV Shows from outside your Plex library.
 - **exclude_genre:** Genres to exclude. E.g. "animation, documentary".
-- **randomize_recommendations:** `true` will randomize recommendations from the top 10% matches to ensure variety across runs. `false` will order on similarity score.
+- **randomize_recommendations:** `true` will randomize recommendations from the top 10% matches to ensure variety across runs. `false` will order by similarity score.
 - **normalize_counters:** `true`will normalize counters to "nerf" outliers.
 - **show_summary:** `true` will show you a brief plot summary for each TV Show.
 - **show_cast:** `true` will show top 3 cast members.
@@ -124,7 +126,7 @@ paths:
 - **add_label:** Adds label to the recommended TV Shows in your Plex library if set to `true`
 - **label_name:** The label to be used
 - **append_usernames:** `true` will append the selected usernames to the `label_name`.
-- **remove_previous_recommendations:** If set to `true` removes the label from previously recommendation runs. If set to `false' simply appends the new recommendations.
+- **remove_previous_recommendations:** If set to `true` removes the label from previously recommendation runs. If set to `false` simply appends the new recommendations.
 
 ### Tautulli
 - **url:** Edit if needed.
@@ -132,7 +134,7 @@ paths:
 - **users:** Which Tautulli users to analyze. Defaults to `None`.
 
 > [!IMPORTANT]
-> Selecting Tautulli users will override 'managed_users'. You can ofcourse also select managed users via Tautulli.
+> Selecting Tautulli users will override and ignore 'managed_users'.
 
 ### Sonarr
 - **url:** Change if needed
@@ -153,7 +155,7 @@ paths:
 - **sync_watch_history:** Can be set to `false` if you already build your Trakt watch history another way (e.g.: through Trakt's Plex Scrobbler).
 
 > [!WARNING]
-> If you already have a populated Trakt account and want to analyze other users on your server, it is highly recommended to create a new Trakt account for use with this script. clear_watch_history needs to be enabled if you're doing runs for different users in order for Trakt to only take the relevant watch history of the given user into account. This will wipe ALL history first and then sync again. Any history you had on Trakt that came from outside of Plex will be gone forever.
+> If you already have a populated Trakt account and want to analyze other users on your server, it is highly recommended to create a new Trakt account for use with this script. clear_watch_history needs to be enabled if you're doing runs for different users in order for Trakt to only take the relevant watch history of the given user(s) into account. This will wipe ALL history first and then sync again. Any history you had on Trakt that came from outside of Plex will be gone forever.
 
 ### TMDB Settings
 - **api_key:** [How to get a TMDB API Key](https://developer.themoviedb.org/docs/getting-started)
