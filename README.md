@@ -225,6 +225,8 @@ If you have many users, I made a script to do this in bulk: 🏷️[User Restric
 ### ❤️ Support the Project
 If you find this project useful, please ⭐ star the repository and share it!
 
+Special thanks to Spyro for testing and feedback. <3
+
 <br/>
 
 [!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/neekokeen)
