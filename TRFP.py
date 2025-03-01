@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 import math
 import copy
 
-__version__ = "2.0b21"
+__version__ = "2.0"
 REPO_URL = "https://github.com/netplexflix/TV-Show-Recommendations-for-Plex"
 API_VERSION_URL = f"https://api.github.com/repos/netplexflix/TV-Show-Recommendations-for-Plex/releases/latest"
 
@@ -514,7 +514,6 @@ class PlexTVRecommender:
         else:
             print(f"Watched count unchanged. Using cached data for {self.cached_watched_count} shows")
             self.watched_data = self.watched_data_counters
-            # Ensure watched_show_ids are preserved
             if not self.watched_show_ids and 'watched_show_ids' in watched_cache:
                 self.watched_show_ids = {int(id_) for id_ in watched_cache['watched_show_ids'] if str(id_).isdigit()}
             if self.debug:
@@ -579,13 +578,10 @@ class PlexTVRecommender:
         for user in managed_users:
             user_lower = user.lower()
             if user_lower in ['admin', 'administrator']:
-                # Special case for admin keywords
                 processed_managed.append(admin_user)
             elif user_lower == admin_user.lower():
-                # Direct match with admin username (case-insensitive)
                 processed_managed.append(admin_user)
             elif user_lower in all_usernames_lower:
-                # Match with shared users
                 processed_managed.append(all_usernames_lower[user_lower])
             else:
                 print(f"{RED}Error: Managed user '{user}' not found{RESET}")
@@ -626,7 +622,6 @@ class PlexTVRecommender:
                 )
                 tautulli_users = users_response.json()['response']['data']
                 
-                # Only process specified user in single user mode
                 users_to_check = [self.single_user] if self.single_user else self.users['tautulli_users']
                 
                 for username in users_to_check:
@@ -707,10 +702,8 @@ class PlexTVRecommender:
                 return 0
 
     def _get_tautulli_user_ids(self):
-        """Resolve configured Tautulli usernames to their user IDs"""
         user_ids = []
         try:
-            # Get all Tautulli users
             users_response = requests.get(
                 f"{self.config['tautulli']['url']}/api/v2",
                 params={
@@ -721,10 +714,8 @@ class PlexTVRecommender:
             users_response.raise_for_status()
             tautulli_users = users_response.json()['response']['data']
     
-            # Determine which users to process based on single_user mode
             users_to_match = [self.single_user] if self.single_user else self.users['tautulli_users']
     
-            # Match configured usernames to user IDs
             for username in users_to_match:
                 user = next(
                     (u for u in tautulli_users 
@@ -763,7 +754,6 @@ class PlexTVRecommender:
             print(f"{RED}No valid Tautulli users found!{RESET}")
             return self._normalize_all_counters(counters)
     
-        # Fetch history for each user with proper pagination
         history_items = []
         for user_id in user_ids:
             print(f"\n{GREEN}Fetching history for user ID: {user_id}{RESET}")
@@ -812,11 +802,9 @@ class PlexTVRecommender:
                     print(f"{RED}Error fetching history page: {e}{RESET}")
                     break
     
-        # Process collected history items
         rating_keys = set()
         show_details = {}
     
-        # Process history items
         for item in history_items:
             if not isinstance(item, dict):
                 continue
@@ -825,7 +813,6 @@ class PlexTVRecommender:
             if rating_key:
                 watched_show_ids.add(int(rating_key))
     
-        # Store watched show IDs in class
         self.watched_show_ids.update(watched_show_ids)
         
         # Use cached show data instead of querying Plex again
@@ -843,13 +830,11 @@ class PlexTVRecommender:
         return self._normalize_all_counters(counters)
        
     def _get_managed_users_watched_data(self):
-        # Return cached data if available and we're not in single user mode
         if not self.single_user and hasattr(self, 'watched_data_counters') and self.watched_data_counters:
             if self.debug:
                 print("DEBUG: Using cached watched data")
             return self.watched_data_counters
     
-        # Only proceed with scanning if we need to
         if hasattr(self, 'watched_data_counters') and self.watched_data_counters:
             if self.debug:
                 print("DEBUG: Using existing watched data")
@@ -867,9 +852,7 @@ class PlexTVRecommender:
         account = MyPlexAccount(token=self.config['plex']['token'])
         admin_user = self.users['admin_user']
         
-        # Determine which users to process
         if self.single_user:
-            # Check if the single user is the admin
             if self.single_user.lower() in ['admin', 'administrator']:
                 users_to_process = [admin_user]
             else:
@@ -879,7 +862,6 @@ class PlexTVRecommender:
         
         for username in users_to_process:
             try:
-                # Check if current user is admin (using case-insensitive comparison)
                 if username.lower() == admin_user.lower():
                     user_plex = self.plex
                 else:
@@ -950,7 +932,6 @@ class PlexTVRecommender:
             rating = max(0, min(10, int(round(rating))))
             multiplier = RATING_MULTIPLIERS.get(rating, 1.0)
     
-            # Process all counters using cached data
             for genre in show_info.get('genres', []):
                 counters['genres'][genre] += multiplier
             
@@ -963,9 +944,7 @@ class PlexTVRecommender:
             if language := show_info.get('language'):
                 counters['languages'][language.lower()] += multiplier
                 
-            # Store TMDB data in caches if available
             if tmdb_id := show_info.get('tmdb_id'):
-                # Using the show_id from the cache key instead of ratingKey
                 show_id = next((k for k, v in self.show_cache.cache['shows'].items() 
                               if v.get('title') == show_info['title'] and 
                               v.get('year') == show_info.get('year')), None)
@@ -1071,7 +1050,6 @@ class PlexTVRecommender:
         rating = max(0, min(10, int(round(rating))))
         multiplier = RATING_MULTIPLIERS.get(rating, 1.0)
     
-        # Process all the existing counters...
         for genre in show_details.get('genres', []):
             counters['genres'][genre] += multiplier
         
@@ -1095,9 +1073,7 @@ class PlexTVRecommender:
                 for episode in watched_episodes:
                     episode.reload()
                     
-                    # Get watched date and TVDB ID
                     if hasattr(episode, 'lastViewedAt') and hasattr(episode, 'guids'):
-                        # Handle lastViewedAt whether it's a timestamp or datetime
                         if isinstance(episode.lastViewedAt, datetime):
                             watched_at = episode.lastViewedAt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
                         else:
@@ -1226,7 +1202,6 @@ class PlexTVRecommender:
         self.watched_show_ids = cleaned_ids
 
     def _refresh_watched_data(self):
-        """Force refresh of watched data"""
         if self.users['tautulli_users']:
             self.watched_data = self._get_tautulli_watched_shows_data()
         else:
@@ -1363,19 +1338,17 @@ class PlexTVRecommender:
         if kw_set:
             if self.debug:
                 print(f"DEBUG: Adding {len(kw_set)} keywords to cache for TMDB ID {tmdb_id}")
-            self.tmdb_keywords_cache[str(tmdb_id)] = list(kw_set)  # Convert key to string
+            self.tmdb_keywords_cache[str(tmdb_id)] = list(kw_set)
             self._save_watched_cache()
         return kw_set
 
     def _get_show_language(self, show) -> str:
-        """Get show's primary audio language from first episode"""
         try:
             episodes = show.episodes()
             if not episodes:
                 print(f"DEBUG: No episodes found")
                 return "N/A"
     
-            # Get and reload first episode
             episode = episodes[0]
             episode.reload()
             
@@ -1533,7 +1506,7 @@ class PlexTVRecommender:
                 
                 if remove_response.status_code == 200:
                     deleted = remove_response.json().get('deleted', {}).get('shows', 0)                   
-                    # Clear the Trakt sync cache
+
                     if os.path.exists(self.trakt_sync_cache_path):
                         try:
                             os.remove(self.trakt_sync_cache_path)
@@ -1824,7 +1797,6 @@ class PlexTVRecommender:
     # CALCULATE SCORES
     # ------------------------------------------------------------------------
     def _calculate_similarity_from_cache(self, show_info: Dict) -> Tuple[float, Dict]:
-        """Calculate similarity score using cached show data and return score with breakdown"""
         try:
             score = 0.0
             score_breakdown = {
@@ -1903,7 +1875,7 @@ class PlexTVRecommender:
                 if matched_actors > 0:
                     actor_score = sum(actor_scores) / matched_actors
                     if matched_actors > 3:
-                        actor_score *= (3 / matched_actors)  # Normalize if many matches
+                        actor_score *= (3 / matched_actors)
                     actor_final = actor_score * weights.get('actor_weight', 0.20)
                     score += actor_final
                     score_breakdown['actor_score'] = round(actor_final, 3)
@@ -1964,6 +1936,7 @@ class PlexTVRecommender:
         if breakdown['details']['keywords']:
             print(f"   └─ Matching keywords: {', '.join(breakdown['details']['keywords'])}")
         print("")
+
     # ------------------------------------------------------------------------
     # GET RECOMMENDATIONS
     # ------------------------------------------------------------------------
@@ -2112,7 +2085,6 @@ class PlexTVRecommender:
 
     def get_recommendations(self) -> Dict[str, List[Dict]]:
         if self.cached_watched_count > 0 and not self.watched_show_ids:
-            # Force refresh of watched data
             if self.users['tautulli_users']:
                 self.watched_data = self._get_tautulli_watched_shows_data()
             else:
