@@ -1,9 +1,12 @@
 general:
   confirm_operations: true
   plex_only: false
+  combine_watch_history: false
   limit_plex_results: 3
   limit_trakt_results: 3
-  exclude_genre: animation, documentary,
+  exclude_genre: none
+  randomize_recommendations: true
+  normalize_counters: true
   show_summary: true
   show_cast: true
   show_language: true
@@ -19,8 +22,10 @@ plex:
   url: http://localhost:32400
   token: YOUR_PLEX_TOKEN
   TV_library_title: TV Shows
+  managed_users: Admin
   add_label: true
   label_name: RecommendedShows
+  append_usernames: true
   remove_previous_recommendations: true
 
 sonarr:
@@ -28,22 +33,27 @@ sonarr:
   api_key: YOUR_SONARR_API_KEY
   root_folder: P:\TV
   add_to_sonarr: true
+  seasonFolder: true
   monitor: true
   monitor_option: none #all, none or firstSeason
   search_missing: true
   quality_profile: HD-1080p
   sonarr_tag: RecommendForPlex
+  append_usernames: true
 
+tautulli:
+  api_key: YOUR_TAUTULLI_API_KEY
+  url: http://localhost:8181
+  users: none #Entering tautulli users will override managed_users!
 
 trakt:
-  access_token: 
   client_id: YOUR_TRAKT_CLIENT_ID
   client_secret: YOUR_TRAKT_CLIENT_SECRET
-  sync_watch_history: true
+  clear_watch_history: false
+  sync_watch_history: false
  
 TMDB:
   api_key: YOUR_TMDB_API_KEY
-  use_TMDB_keywords: true
 
 weights: #Make sure the total equals 1
   genre_weight: 0.25

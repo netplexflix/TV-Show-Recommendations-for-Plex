@@ -1,7 +1,8 @@
 import os
 import plexapi.server
+from plexapi.server import PlexServer
+from plexapi.myplex import MyPlexAccount
 import yaml
-from datetime import datetime
 import sys
 import requests
 from typing import Dict, List, Set, Optional, Tuple
@@ -13,8 +14,10 @@ import json
 from urllib.parse import quote
 import re
 from datetime import datetime, timedelta
+import math
+import copy
 
-__version__ = "1.0"
+__version__ = "2.0"
 REPO_URL = "https://github.com/netplexflix/TV-Show-Recommendations-for-Plex"
 API_VERSION_URL = f"https://api.github.com/repos/netplexflix/TV-Show-Recommendations-for-Plex/releases/latest"
 
@@ -62,6 +65,20 @@ def get_full_language_name(lang_code: str) -> str:
     }
     return LANGUAGE_CODES.get(lang_code.lower(), lang_code.capitalize())
 
+RATING_MULTIPLIERS = {
+    0: 0.1,   # Strong dislike
+    1: 0.2,   # Very poor
+    2: 0.4,   # Poor
+    3: 0.6,   # Below average
+    4: 0.8,   # Slightly below average
+    5: 1.0,   # Neutral/baseline
+    6: 1.2,   # Slightly above average
+    7: 1.4,   # Good
+    8: 1.6,   # Very good
+    9: 1.8,   # Excellent
+    10: 2.0   # Outstanding
+    }
+	
 def check_version():
     try:
         response = requests.get(API_VERSION_URL)
@@ -79,60 +96,277 @@ def check_version():
     except Exception as e:
         print(f"{YELLOW}Unable to check for updates: {str(e)}{RESET}")
 
-class DateTimeEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, datetime):
-            return obj.isoformat()
-        return super().default(obj)
+class ShowCache:
+    def __init__(self, cache_dir: str, recommender=None):
+        self.all_shows_cache_path = os.path.join(cache_dir, "all_shows_cache.json")
+        self.cache = self._load_cache()
+        self.recommender = recommender  # Store reference to recommender
+        
+    def _load_cache(self) -> Dict:
+        if os.path.exists(self.all_shows_cache_path):
+            try:
+                with open(self.all_shows_cache_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"{YELLOW}Error loading all shows cache: {e}{RESET}")
+                return {'shows': {}, 'last_updated': None, 'library_count': 0}
+        return {'shows': {}, 'last_updated': None, 'library_count': 0}
+    
+    def update_cache(self, plex, library_title: str, tmdb_api_key: Optional[str] = None):
+        shows_section = plex.library.section(library_title)
+        all_shows = shows_section.all()
+        current_count = len(all_shows)
+        
+        if current_count == self.cache['library_count']:
+            print(f"{GREEN}Show cache is up to date{RESET}")
+            return False
+            
+        print(f"\n{YELLOW}Analyzing library shows...{RESET}")
+        
+        current_shows = set(str(show.ratingKey) for show in all_shows)
+        removed = set(self.cache['shows'].keys()) - current_shows
+        
+        if removed:
+            print(f"{YELLOW}Removing {len(removed)} shows from cache that are no longer in library{RESET}")
+            for show_id in removed:
+                del self.cache['shows'][show_id]
+        
+        existing_ids = set(self.cache['shows'].keys())
+        new_shows = [show for show in all_shows if str(show.ratingKey) not in existing_ids]
+        
+        if new_shows:
+            print(f"Found {len(new_shows)} new shows to analyze")
+            
+            for i, show in enumerate(new_shows, 1):
+                msg = f"\r{CYAN}Processing show {i}/{len(new_shows)} ({int((i/len(new_shows))*100)}%){RESET}"
+                sys.stdout.write(msg)
+                sys.stdout.flush()
+                
+                show_id = str(show.ratingKey)
+                try:
+                    show.reload()
+                    
+                    # Add delay between shows
+                    if i > 1 and tmdb_api_key:
+                        time.sleep(0.5)  # Basic rate limiting
+                    
+                    imdb_id = None
+                    tmdb_id = None
+                    if hasattr(show, 'guids'):
+                        for guid in show.guids:
+                            if 'imdb://' in guid.id:
+                                imdb_id = guid.id.replace('imdb://', '')
+                            elif 'themoviedb://' in guid.id:
+                                try:
+                                    tmdb_id = int(guid.id.split('themoviedb://')[1].split('?')[0])
+                                except (ValueError, IndexError):
+                                    pass
+                    
+                    # TMDB ID search with retries
+                    if not tmdb_id and tmdb_api_key:
+                        max_retries = 3
+                        for attempt in range(max_retries):
+                            try:
+                                params = {
+                                    'api_key': tmdb_api_key,
+                                    'query': show.title,
+                                    'first_air_date_year': getattr(show, 'year', None)
+                                }
+                                resp = requests.get(
+                                    "https://api.themoviedb.org/3/search/tv",
+                                    params=params,
+                                    timeout=15
+                                )
+                                
+                                if resp.status_code == 429:
+                                    sleep_time = 2 * (attempt + 1)
+                                    print(f"{YELLOW}TMDB rate limit hit, waiting {sleep_time}s...{RESET}")
+                                    time.sleep(sleep_time)
+                                    continue
+                                    
+                                if resp.status_code == 200:
+                                    results = resp.json().get('results', [])
+                                    if results:
+                                        tmdb_id = results[0]['id']
+                                    break
+                                    
+                            except (requests.exceptions.ConnectionError, 
+                                   requests.exceptions.Timeout,
+                                   requests.exceptions.ChunkedEncodingError) as e:
+                                print(f"{YELLOW}Connection error, retrying... ({attempt+1}/{max_retries}){RESET}")
+                                time.sleep(1)
+                                if attempt == max_retries - 1:
+                                    print(f"{YELLOW}Failed to get TMDB ID for {show.title} after {max_retries} tries{RESET}")
+                            except Exception as e:
+                                print(f"{YELLOW}Error getting TMDB ID for {show.title}: {e}{RESET}")
+                                break
+    
+                    tmdb_keywords = []
+                    if tmdb_id and tmdb_api_key:
+                        max_retries = 3
+                        for attempt in range(max_retries):
+                            try:
+                                kw_resp = requests.get(
+                                    f"https://api.themoviedb.org/3/tv/{tmdb_id}/keywords",
+                                    params={'api_key': tmdb_api_key},
+                                    timeout=15
+                                )
+                                
+                                if kw_resp.status_code == 429:
+                                    sleep_time = 2 * (attempt + 1)
+                                    print(f"{YELLOW}TMDB rate limit hit, waiting {sleep_time}s...{RESET}")
+                                    time.sleep(sleep_time)
+                                    continue
+                                    
+                                if kw_resp.status_code == 200:
+                                    keywords = kw_resp.json().get('results', [])
+                                    tmdb_keywords = [k['name'].lower() for k in keywords]
+                                    break
+                                    
+                            except (requests.exceptions.ConnectionError,
+                                   requests.exceptions.Timeout,
+                                   requests.exceptions.ChunkedEncodingError) as e:
+                                print(f"{YELLOW}Connection error, retrying... ({attempt+1}/{max_retries}){RESET}")
+                                time.sleep(1)
+                                if attempt == max_retries - 1:
+                                    print(f"{YELLOW}Failed to get keywords for {show.title} after {max_retries} tries{RESET}")
+                            except Exception as e:
+                                print(f"{YELLOW}Error getting TMDB keywords for {show.title}: {e}{RESET}")
+                                break
+    
+                    # Store in recommender's caches if available
+                    if self.recommender and tmdb_id:
+                        self.recommender.plex_tmdb_cache[str(show.ratingKey)] = tmdb_id
+                        if tmdb_keywords:
+                            self.recommender.tmdb_keywords_cache[str(tmdb_id)] = tmdb_keywords
+                    
+                    show_info = {
+                        'title': show.title,
+                        'year': getattr(show, 'year', None),
+                        'genres': [g.tag.lower() for g in show.genres] if hasattr(show, 'genres') else [],
+                        'studio': getattr(show, 'studio', 'N/A'),
+                        'cast': [r.tag for r in show.roles[:3]] if hasattr(show, 'roles') else [],
+                        'summary': getattr(show, 'summary', ''),
+                        'language': self._get_show_language(show),
+                        'tmdb_keywords': tmdb_keywords,
+                        'tmdb_id': tmdb_id,
+                        'imdb_id': imdb_id
+                    }
+                    self.cache['shows'][show_id] = show_info
+                    
+                except Exception as e:
+                    print(f"{YELLOW}Error processing show {show.title}: {e}{RESET}")
+                    continue
+                    
+        self.cache['library_count'] = current_count
+        self.cache['last_updated'] = datetime.now().isoformat()
+        self._save_cache()
+        print(f"\n{GREEN}Show cache updated{RESET}")
+        return True
+        
+    def _save_cache(self):
+        try:
+            with open(self.all_shows_cache_path, 'w', encoding='utf-8') as f:
+                json.dump(self.cache, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print(f"{RED}Error saving all shows cache: {e}{RESET}")
+
+    def _get_show_language(self, show) -> str:
+        """Get show's primary audio language from first episode"""
+        try:
+            episodes = show.episodes()
+            if not episodes:
+                return "N/A"
+    
+            episode = episodes[0]
+            episode.reload()
+            
+            if not episode.media:
+                return "N/A"
+                
+            for media in episode.media:
+                for part in media.parts:
+                    audio_streams = part.audioStreams()
+                    
+                    if audio_streams:
+                        audio = audio_streams[0]                     
+                        lang_code = (
+                            getattr(audio, 'languageTag', None) or
+                            getattr(audio, 'language', None)
+                        )
+                        if lang_code:
+                            return get_full_language_name(lang_code)
+                            
+        except Exception as e:
+            print(f"DEBUG: Language detection failed: {str(e)}")
+        return "N/A"
+
+    def cleanup_removed_shows(self):
+        """Remove shows from cache that no longer exist in the library"""
+        current_shows = set(str(show.ratingKey) for show in self.plex.library.section(self.library_title).all())
+        removed = set(self.cache['shows'].keys()) - current_shows
+        
+        if removed:
+            print(f"{YELLOW}Removing {len(removed)} shows from cache that are no longer in library{RESET}")
+            for show_id in removed:
+                del self.cache['shows'][show_id]
+            self._save_cache()
 
 class PlexTVRecommender:
-    def __init__(self, config_path: str):
-        # Initialize default attributes
+    def __init__(self, config_path: str, single_user: str = None):
+        self.single_user = single_user
+        self.config = self._load_config(config_path)
+        self.library_title = self.config['plex'].get('TV_library_title', 'TV Shows')
+        
+        # Initialize counters and caches
         self.cached_watched_count = 0
         self.cached_unwatched_count = 0
         self.cached_library_show_count = 0
         self.watched_data_counters = {}
+        self.synced_show_ids = set()
         self.cached_unwatched_shows = []
         self.plex_tmdb_cache = {}
         self.tmdb_keywords_cache = {}
-        self.synced_trakt_history = {}
-        self.synced_show_ids = set()
-
-        self.use_tmdb_keywords = False
-        self.tmdb_api_key = None
-
+        self.tautulli_watched_rating_keys = set()
+        self.watched_show_ids = set()
+        self.users = self._get_configured_users()
     
         print("Initializing recommendation system...")
-        self.config = self._load_config(config_path)
+        if self.config.get('tautulli', {}).get('users'):
+            if not self.config['tautulli'].get('url') or not self.config['tautulli'].get('api_key'):
+                raise ValueError("Tautulli configuration requires both url and api_key when users are specified")        
         
-        # Load TMDB config
-        tmdb_config = self.config.get('TMDB', {})
-        self.use_tmdb_keywords = tmdb_config.get('use_TMDB_keywords', False)
-        self.tmdb_api_key = tmdb_config.get('api_key', None)
-    
         print("Connecting to Plex server...")
         self.plex = self._init_plex()
         print(f"Connected to Plex successfully!\n")
-        print(f"{YELLOW}Checking Cache...{RESET}")
-    
-        # Load general config
         general_config = self.config.get('general', {})
+        self.debug = general_config.get('debug', False)
+        print(f"{YELLOW}Checking Cache...{RESET}")	
+        tmdb_config = self.config.get('TMDB', {})
+        self.use_tmdb_keywords = tmdb_config.get('use_TMDB_keywords', True)
+        self.tmdb_api_key = tmdb_config.get('api_key', None)
+		
+        self.cache_dir = os.path.join(os.path.dirname(__file__), "cache")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.show_cache = ShowCache(self.cache_dir, recommender=self)
+        self.show_cache.update_cache(self.plex, self.library_title, self.tmdb_api_key)
+
         self.confirm_operations = general_config.get('confirm_operations', False)
         self.limit_plex_results = general_config.get('limit_plex_results', 10)
         self.limit_trakt_results = general_config.get('limit_trakt_results', 10)
+        self.combine_watch_history = general_config.get('combine_watch_history', True)
+        self.randomize_recommendations = general_config.get('randomize_recommendations', True)
+        self.normalize_counters = general_config.get('normalize_counters', True)
         self.show_summary = general_config.get('show_summary', False)
         self.plex_only = general_config.get('plex_only', False)
         self.show_cast = general_config.get('show_cast', False)
-        self.show_studio = general_config.get('show_studio', False)
         self.show_language = general_config.get('show_language', False)
-        self.show_imdb_link = general_config.get('show_imdb_link', False)
         self.show_rating = general_config.get('show_rating', False)
+        self.show_imdb_link = general_config.get('show_imdb_link', False)
         
-        # Set up excluded genres
         exclude_genre_str = general_config.get('exclude_genre', '')
         self.exclude_genres = [g.strip().lower() for g in exclude_genre_str.split(',') if g.strip()] if exclude_genre_str else []
-    
-        # Load weights
+
         weights_config = self.config.get('weights', {})
         self.weights = {
             'genre_weight': float(weights_config.get('genre_weight', 0.25)),
@@ -141,70 +375,11 @@ class PlexTVRecommender:
             'language_weight': float(weights_config.get('language_weight', 0.10)),
             'keyword_weight': float(weights_config.get('keyword_weight', 0.25))
         }
-    
-        # Validate weights
+
         total_weight = sum(self.weights.values())
         if not abs(total_weight - 1.0) < 1e-6:
             print(f"{YELLOW}Warning: Weights sum to {total_weight}, expected 1.0.{RESET}")
-    
-        # Set up cache paths
-        self.cache_dir = os.path.join(os.path.dirname(__file__), "cache")
-        os.makedirs(self.cache_dir, exist_ok=True)
-        
-        self.watched_cache_path = os.path.join(self.cache_dir, "watched_data_cache.json")
-        self.unwatched_cache_path = os.path.join(self.cache_dir, "unwatched_data_cache.json")
-        self.trakt_sync_cache_path = os.path.join(self.cache_dir, "trakt_sync_cache.json")
-    
-        # Get current counts from Plex
-        self.library_title = self.config['plex'].get('TV_library_title', 'TV Shows')
-        self.library_shows = self._get_library_shows_set()
-        self.current_watched_count = self._get_watched_count()
-        self.current_unwatched_count = len(self.library_shows) - self.current_watched_count
-    
-        # Load and validate watched shows cache
-        cache_valid = False
-        if os.path.exists(self.watched_cache_path):
-            try:
-                with open(self.watched_cache_path, 'r', encoding='utf-8') as f:
-                    watched_cache = json.load(f)
-                    cached_count = watched_cache.get('watched_count', 0)
-                    if cached_count == self.current_watched_count:
-                        self.cached_watched_count = cached_count
-                        self.watched_data_counters = watched_cache.get('watched_data_counters', {})
-                        self.plex_tmdb_cache = watched_cache.get('plex_tmdb_cache', {})
-                        self.tmdb_keywords_cache = watched_cache.get('tmdb_keywords_cache', {})
-                        if self.watched_data_counters:
-                            cache_valid = True
-                            
-            except Exception as e:
-                print(f"{YELLOW}Error loading watched cache: {e}{RESET}")
-
-        # Load and validate unwatched shows cache
-        if os.path.exists(self.unwatched_cache_path):
-            try:
-                with open(self.unwatched_cache_path, 'r', encoding='utf-8') as f:
-                    unwatched_cache = json.load(f)
-                    self.cached_unwatched_count = unwatched_cache.get('unwatched_count', 0)
-                    self.cached_library_show_count = unwatched_cache.get('library_show_count', 0)
-                    self.cached_unwatched_shows = unwatched_cache.get('unwatched_show_details', [])
-            except Exception as e:
-                print(f"{YELLOW}Error loading unwatched cache: {e}{RESET}")
-				
-        # Use cache or rebuild watched data
-        if cache_valid:
-            print("Watched shows count unchanged. Using cached data.")
-            self.watched_data = self.watched_data_counters
-        else:
-            print("Watched shows count changed or cache invalid. Rebuilding profile.")
-            self.watched_data = self._get_watched_shows_data()
-            self.watched_data_counters = self.watched_data
-            self.cached_watched_count = self.current_watched_count
-            self._save_watched_cache()
-
-        # Load Trakt sync cache
-        self.synced_show_ids = self._load_trakt_sync_cache()
-		
-        # Initialize Trakt
+			
         trakt_config = self.config.get('trakt', {})
         self.sync_watch_history = trakt_config.get('sync_watch_history', False)
         self.trakt_headers = {
@@ -216,12 +391,140 @@ class PlexTVRecommender:
             self.trakt_headers['Authorization'] = f"Bearer {trakt_config['access_token']}"
         else:
             self._authenticate_trakt()
-    
-        # Initialize Sonarr
+
+        # Verify Tautulli/Plex user mapping
+        if self.users['tautulli_users']:
+            users_to_validate = [self.single_user] if self.single_user else self.users['tautulli_users']
+            print(f"Validating Tautulli user{'s' if not self.single_user else ''}: {users_to_validate}")
+            
+            if any(u.lower() == 'all' for u in users_to_validate):
+                print(f"{YELLOW}Using watch history for all Tautulli users{RESET}")
+            else:
+                try:
+                    test_params = {'apikey': self.config['tautulli']['api_key'], 'cmd': 'get_users'}
+                    users_response = requests.get(f"{self.config['tautulli']['url']}/api/v2", params=test_params)
+                    if users_response.status_code == 200:
+                        tautulli_users = users_response.json()['response']['data']
+                        tautulli_usernames = [u['username'] for u in tautulli_users]
+                        missing = [u for u in users_to_validate if u not in tautulli_usernames]
+                        
+                        if missing:
+                            # Check for case-insensitive matches
+                            for missing_user in missing:
+                                close_matches = [t for t in tautulli_usernames 
+                                               if t.lower() == missing_user.lower()]
+                                if close_matches:
+                                    print(f"\n{RED}Error: User '{missing_user}' not found, but found similar username: "
+                                          f"'{close_matches[0]}'{RESET}")
+                                    print(f"Tautulli usernames are case-sensitive. Please update your config file "
+                                          f"to match the exact username.")
+                                else:
+                                    print(f"\n{RED}Error: User '{missing_user}' not found in Tautulli.{RESET}")
+                                    print("Available Tautulli users:")
+                                    for username in tautulli_usernames:
+                                        print(f"- {username}")
+                            raise ValueError("Please check your Tautulli usernames and ensure they match exactly.")
+                except requests.exceptions.RequestException as e:
+                    raise ValueError(f"Error connecting to Tautulli: {e}")
+
+        # Verify library exists
+        if not self.plex.library.section(self.library_title):
+            raise ValueError(f"TV Show library '{self.library_title}' not found in Plex")
+        
+
+
         self.sonarr_config = self.config.get('sonarr', {})
+        
+        # Get user context for cache files
+        if single_user:
+            user_ctx = f"plex_{single_user}" if not self.users['tautulli_users'] else f"tautulli_{single_user}"
+        else:
+            if self.users['tautulli_users']:
+                user_ctx = 'tautulli_' + '_'.join(self.users['tautulli_users'])
+            else:
+                user_ctx = 'plex_' + '_'.join(self.users['managed_users'])
+        
+        safe_ctx = re.sub(r'\W+', '', user_ctx)
+        
+        # Update cache paths to be user-specific
+        self.watched_cache_path = os.path.join(self.cache_dir, f"watched_cache_{safe_ctx}.json")
+        self.trakt_cache_path = os.path.join(self.cache_dir, f"trakt_sync_cache_{safe_ctx}.json")
+        self.trakt_sync_cache_path = os.path.join(self.cache_dir, "trakt_sync_cache.json")
+         
+        # Load watched cache 
+        watched_cache = {}
+        if os.path.exists(self.watched_cache_path):
+            try:
+                with open(self.watched_cache_path, 'r', encoding='utf-8') as f:
+                    watched_cache = json.load(f)
+                    self.cached_watched_count = watched_cache.get('watched_count', 0)
+                    self.watched_data_counters = watched_cache.get('watched_data_counters', {})
+                    self.plex_tmdb_cache = {str(k): v for k, v in watched_cache.get('plex_tmdb_cache', {}).items()}
+                    self.tmdb_keywords_cache = {str(k): v for k, v in watched_cache.get('tmdb_keywords_cache', {}).items()}
+                    
+                    # Load watched show IDs
+                    watched_ids = watched_cache.get('watched_show_ids', [])
+                    if isinstance(watched_ids, list):
+                        self.watched_show_ids = {int(id_) for id_ in watched_ids if str(id_).isdigit()}
+                    else:
+                        print(f"{YELLOW}Warning: Invalid watched_show_ids format in cache{RESET}")
+                        self.watched_show_ids = set()
+                    
+                    if not self.watched_show_ids and self.cached_watched_count > 0:
+                        print(f"{RED}Warning: Cached watched count is {self.cached_watched_count} but no valid IDs loaded{RESET}")
+                        # Force a refresh of watched data
+                        self._refresh_watched_data()
+                    
+            except Exception as e:
+                print(f"{YELLOW}Error loading watched cache: {e}{RESET}")
+                self._refresh_watched_data()  
+        current_library_ids = self._get_library_shows_set()
+        
+        # Clean up both watched show tracking mechanisms
+        self.tautulli_watched_rating_keys = {
+            rk for rk in self.tautulli_watched_rating_keys 
+            if int(rk) in current_library_ids
+        }
+        self.watched_show_ids = {
+            show_id for show_id in self.watched_show_ids
+            if show_id in current_library_ids
+        }
+						
+        if self.plex_tmdb_cache is None:
+            self.plex_tmdb_cache = {}
+        if self.tmdb_keywords_cache is None:
+            self.tmdb_keywords_cache = {}
+        if not hasattr(self, 'synced_trakt_history'):
+            self.synced_trakt_history = {}
+
+        current_watched_count = self._get_watched_count()
+        cache_exists = os.path.exists(self.watched_cache_path)
+        
+        if (not cache_exists) or (current_watched_count != self.cached_watched_count):
+            print("Watched count changed or no cache found; gathering watched data now. This may take a while...\n")
+            if self.users['tautulli_users']:
+                print("Using Tautulli users for watch history")
+                self.watched_data = self._get_tautulli_watched_shows_data()
+            else:
+                print("Using managed users for watch history")
+                self.watched_data = self._get_managed_users_watched_data()
+            self.watched_data_counters = self.watched_data
+            self.cached_watched_count = current_watched_count
+            self._save_watched_cache()
+        else:
+            print(f"Watched count unchanged. Using cached data for {self.cached_watched_count} shows")
+            self.watched_data = self.watched_data_counters
+            if not self.watched_show_ids and 'watched_show_ids' in watched_cache:
+                self.watched_show_ids = {int(id_) for id_ in watched_cache['watched_show_ids'] if str(id_).isdigit()}
+            if self.debug:
+                print(f"DEBUG: Loaded {len(self.watched_show_ids)} watched show IDs from cache")
+            
+        print("Fetching library metadata (for existing Shows checks)...")
+        self.library_shows = self._get_library_shows_set()
+        self.library_imdb_ids = self._get_library_imdb_ids()
  
     # ------------------------------------------------------------------------
-    # CONFIG / PLEX SETUP
+    # CONFIG / SETUP
     # ------------------------------------------------------------------------
     def _load_config(self, config_path: str) -> Dict:
         try:
@@ -243,99 +546,370 @@ class PlexTVRecommender:
             print(f"{RED}Error connecting to Plex server: {e}{RESET}")
             raise
 
-    def _authenticate_trakt(self):
-        try:
-            response = requests.post(
-                'https://api.trakt.tv/oauth/device/code',
-                headers={'Content-Type': 'application/json'},
-                json={'client_id': self.config['trakt']['client_id']}
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                device_code = data['device_code']
-                user_code = data['user_code']
-                verification_url = data['verification_url']
-                
-                print(f"\n{GREEN}Please visit {verification_url} and enter code: {CYAN}{user_code}{RESET}")
-                print("Waiting for authentication...")
-                webbrowser.open(verification_url)
-                
-                poll_interval = data['interval']
-                expires_in = data['expires_in']
-                start_time = time.time()
-                
-                while time.time() - start_time < expires_in:
-                    time.sleep(poll_interval)
-                    token_response = requests.post(
-                        'https://api.trakt.tv/oauth/device/token',
-                        headers={'Content-Type': 'application/json'},
-                        json={
-                            'code': device_code,
-                            'client_id': self.config['trakt']['client_id'],
-                            'client_secret': self.config['trakt']['client_secret']
-                        }
-                    )
-                    
-                    if token_response.status_code == 200:
-                        token_data = token_response.json()
-                        self.config['trakt']['access_token'] = token_data['access_token']
-                        self.trakt_headers['Authorization'] = f"Bearer {token_data['access_token']}"
-                        
-                        with open(os.path.join(os.path.dirname(__file__), 'config.yml'), 'w') as f:
-                            yaml.dump(self.config, f)
-                            
-                        print(f"{GREEN}Successfully authenticated with Trakt!{RESET}")
-                        return
-                    elif token_response.status_code != 400:
-                        print(f"{RED}Error getting token: {token_response.status_code}{RESET}")
-                        return
-                print(f"{RED}Authentication timed out{RESET}")
+    # ------------------------------------------------------------------------
+    # USERS
+    # ------------------------------------------------------------------------ 
+    def _get_configured_users(self):
+        # Get raw managed users list from config
+        raw_managed = self.config['plex'].get('managed_users', '')
+        managed_users = [u.strip() for u in raw_managed.split(',') if u.strip()]
+        
+        # Get Tautulli users
+        tautulli_users = []
+        tautulli_config = self.config.get('tautulli', {})
+        
+        # Check if Tautulli users is 'none' or empty
+        tautulli_user_config = tautulli_config.get('users')
+        if tautulli_user_config and str(tautulli_user_config).lower() != 'none':
+            if isinstance(tautulli_user_config, list):
+                tautulli_users = tautulli_user_config
+            elif isinstance(tautulli_user_config, str):
+                tautulli_users = [u.strip() for u in tautulli_user_config.split(',') if u.strip()]
+        
+        # Resolve admin account
+        account = MyPlexAccount(token=self.config['plex']['token'])
+        admin_user = account.username
+        
+        # User validation logic
+        all_users = account.users()
+        all_usernames_lower = {u.title.lower(): u.title for u in all_users}
+        
+        processed_managed = []
+        for user in managed_users:
+            user_lower = user.lower()
+            if user_lower in ['admin', 'administrator']:
+                processed_managed.append(admin_user)
+            elif user_lower == admin_user.lower():
+                processed_managed.append(admin_user)
+            elif user_lower in all_usernames_lower:
+                processed_managed.append(all_usernames_lower[user_lower])
             else:
-                print(f"{RED}Error getting device code: {response.status_code}{RESET}")
+                print(f"{RED}Error: Managed user '{user}' not found{RESET}")
+                raise ValueError(f"User '{user}' not found in Plex account")
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        managed_users = [u for u in processed_managed if not (u in seen or seen.add(u))]
+        
+        return {
+            'managed_users': managed_users,
+            'tautulli_users': tautulli_users,
+            'admin_user': admin_user
+        }
+
+    def _get_current_users(self) -> str:
+        if self.users['tautulli_users']:
+            return f"Tautulli users: {', '.join(self.users['tautulli_users'])}"
+        return f"Managed users: {', '.join(self.users['managed_users'])}"
+
+    def _get_user_specific_connection(self):
+        if self.users['tautulli_users']:
+            return self.plex
+        try:
+            account = MyPlexAccount(token=self.config['plex']['token'])
+            user = account.user(self.users['managed_users'][0])
+            return self.plex.switchUser(user)
+        except:
+            return self.plex
+
+    def _get_watched_count(self) -> int:
+        if self.users['tautulli_users']:
+            user_ids = []
+            try:
+                users_response = requests.get(
+                    f"{self.config['tautulli']['url']}/api/v2",
+                    params={'apikey': self.config['tautulli']['api_key'], 'cmd': 'get_users'}
+                )
+                tautulli_users = users_response.json()['response']['data']
+                
+                users_to_check = [self.single_user] if self.single_user else self.users['tautulli_users']
+                
+                for username in users_to_check:
+                    user = next((u for u in tautulli_users 
+                               if u['username'].lower() == username.lower()), None)
+                    if user:
+                        user_ids.append(str(user['user_id']))
+            except Exception as e:
+                print(f"{YELLOW}Error resolving users: {e}{RESET}")
+                return 0
+    
+            grandparent_keys = set()
+            for user_id in user_ids:
+                start = 0
+                while True:
+                    params = {
+                        'apikey': self.config['tautulli']['api_key'],
+                        'cmd': 'get_history',
+                        'media_type': 'episode',
+                        'user_id': user_id,
+                        'length': 1000,
+                        'start': start
+                    }
+                    response = requests.get(f"{self.config['tautulli']['url']}/api/v2", params=params)
+                    data = response.json()['response']['data']
+                    
+                    if isinstance(data, dict):
+                        page_items = data.get('data', [])
+                        total_records = data.get('recordsFiltered', 0)
+                    else:
+                        page_items = data
+                        total_records = len(page_items)
+                    
+                    for item in page_items:
+                        if item.get('grandparent_rating_key'):
+                            grandparent_keys.add(str(item['grandparent_rating_key']))
+                    
+                    if len(page_items) < params['length'] or start >= total_records:
+                        break
+                    start += len(page_items)
+    
+            return len(grandparent_keys)
+        else:
+            # For managed users
+            try:
+                total_watched = set()
+                shows_section = self.plex.library.section(self.library_title)
+                account = MyPlexAccount(token=self.config['plex']['token'])
+                
+                # Determine which users to process
+                if self.single_user:
+                    if self.single_user.lower() in ['admin', 'administrator']:
+                        users_to_process = [self.users['admin_user']]
+                    else:
+                        users_to_process = [self.single_user]
+                else:
+                    users_to_process = self.users['managed_users'] or [self.users['admin_user']]
+                
+                for username in users_to_process:
+                    try:
+                        if username.lower() == self.users['admin_user'].lower():
+                            user_plex = self.plex
+                        else:
+                            user = account.user(username)
+                            user_plex = self.plex.switchUser(user)
+                        
+                        watched_shows = user_plex.library.section(self.library_title).search(unwatched=False)
+                        total_watched.update(show.ratingKey for show in watched_shows)
+                        
+                    except Exception as e:
+                        print(f"{YELLOW}Error getting watch count for user {username}: {e}{RESET}")
+                        continue
+                        
+                return len(total_watched)
+                
+            except Exception as e:
+                print(f"{YELLOW}Error getting watch count: {e}{RESET}")
+                return 0
+
+    def _get_tautulli_user_ids(self):
+        user_ids = []
+        try:
+            users_response = requests.get(
+                f"{self.config['tautulli']['url']}/api/v2",
+                params={
+                    'apikey': self.config['tautulli']['api_key'],
+                    'cmd': 'get_users'
+                }
+            )
+            users_response.raise_for_status()
+            tautulli_users = users_response.json()['response']['data']
+    
+            users_to_match = [self.single_user] if self.single_user else self.users['tautulli_users']
+    
+            for username in users_to_match:
+                user = next(
+                    (u for u in tautulli_users 
+                     if u['username'].lower() == username.lower()),
+                    None
+                )
+                if user:
+                    user_ids.append(str(user['user_id']))
+                else:
+                    print(f"{RED}User '{username}' not found in Tautulli!{RESET}")
+    
         except Exception as e:
-            print(f"{RED}Error during Trakt authentication: {e}{RESET}")
+            print(f"{RED}Error resolving Tautulli users: {e}{RESET}")
+        
+        return user_ids
+		
+    def _get_tautulli_watched_shows_data(self) -> Dict:
+        if not self.single_user and hasattr(self, 'watched_data_counters') and self.watched_data_counters:
+            return self.watched_data_counters
+    
+        shows_section = self.plex.library.section(self.library_title)
+        counters = {
+            'genres': Counter(),
+            'studio': Counter(),
+            'actors': Counter(),
+            'languages': Counter(),
+            'tmdb_keywords': Counter(),
+            'tmdb_ids': set()
+        }
+        watched_show_ids = set()
+        not_found_count = 0
+    
+        print(f"{YELLOW}Resolving Tautulli user IDs...{RESET}")
+        user_ids = self._get_tautulli_user_ids()
+        if not user_ids:
+            print(f"{RED}No valid Tautulli users found!{RESET}")
+            return self._normalize_all_counters(counters)
+    
+        history_items = []
+        for user_id in user_ids:
+            print(f"\n{GREEN}Fetching history for user ID: {user_id}{RESET}")
+            start = 0
+            total_records = None
+    
+            while True:
+                params = {
+                    'apikey': self.config['tautulli']['api_key'],
+                    'cmd': 'get_history',
+                    'media_type': 'episode',
+                    'user_id': user_id,
+                    'length': 1000,  # Max per Tautulli API
+                    'start': start
+                }
+    
+                try:
+                    response = requests.get(
+                        f"{self.config['tautulli']['url']}/api/v2",
+                        params=params
+                    )
+                    response.raise_for_status()
+                    response_data = response.json()
+                    history_data = response_data['response'].get('data', {})
+    
+                    # Handle different response formats
+                    if isinstance(history_data, dict):
+                        page_items = history_data.get('data', [])
+                        total_records = history_data.get('recordsFiltered', 0)
+                    else:  # Legacy format
+                        page_items = history_data
+                        total_records = len(page_items)
+    
+                    history_items.extend(page_items)
+                    print(f"Fetched {len(page_items)} episodes (Total: {len(history_items)})")
+    
+                    # Exit conditions
+                    if not page_items or len(page_items) == 0:
+                        break
+                    if start + len(page_items) >= total_records:
+                        break
+    
+                    start += len(page_items)  # Proper pagination increment
+    
+                except Exception as e:
+                    print(f"{RED}Error fetching history page: {e}{RESET}")
+                    break
+    
+        rating_keys = set()
+        show_details = {}
+    
+        for item in history_items:
+            if not isinstance(item, dict):
+                continue
+                
+            rating_key = str(item.get('grandparent_rating_key'))
+            if rating_key:
+                watched_show_ids.add(int(rating_key))
+    
+        self.watched_show_ids.update(watched_show_ids)
+        
+        # Use cached show data instead of querying Plex again
+        print(f"\nProcessing {len(watched_show_ids)} unique watched shows from Tautulli history:")
+        for i, show_id in enumerate(watched_show_ids, 1):
+            self._show_progress("Processing", i, len(watched_show_ids))
+            
+            show_info = self.show_cache.cache['shows'].get(str(show_id))
+            if show_info:
+                self._process_show_counters_from_cache(show_info, counters)
+            else:
+                not_found_count += 1
+        if self.debug:
+            print(f"{YELLOW}{not_found_count} watched shows not found in cache{RESET}")
+        return self._normalize_all_counters(counters)
+       
+    def _get_managed_users_watched_data(self):
+        if not self.single_user and hasattr(self, 'watched_data_counters') and self.watched_data_counters:
+            if self.debug:
+                print("DEBUG: Using cached watched data")
+            return self.watched_data_counters
+    
+        if hasattr(self, 'watched_data_counters') and self.watched_data_counters:
+            if self.debug:
+                print("DEBUG: Using existing watched data")
+            return self.watched_data_counters
+    
+        counters = {
+            'genres': Counter(),
+            'studio': Counter(),
+            'actors': Counter(),
+            'languages': Counter(),
+            'tmdb_keywords': Counter(),
+            'tmdb_ids': set()
+        }
+        
+        account = MyPlexAccount(token=self.config['plex']['token'])
+        admin_user = self.users['admin_user']
+        
+        if self.single_user:
+            if self.single_user.lower() in ['admin', 'administrator']:
+                users_to_process = [admin_user]
+            else:
+                users_to_process = [self.single_user]
+        else:
+            users_to_process = self.users['managed_users'] or [admin_user]
+        
+        for username in users_to_process:
+            try:
+                if username.lower() == admin_user.lower():
+                    user_plex = self.plex
+                else:
+                    user = account.user(username)
+                    user_plex = self.plex.switchUser(user)
+                
+                watched_shows = user_plex.library.section(self.library_title).search(unwatched=False)
+                
+                print(f"\nScanning watched shows for {username}")
+                for i, show in enumerate(watched_shows, 1):
+                    self._show_progress(f"Processing {username}'s watched", i, len(watched_shows))
+                    self.watched_show_ids.add(int(show.ratingKey))
+                    
+                    show_info = self.show_cache.cache['shows'].get(str(show.ratingKey))
+                    if show_info:
+                        self._process_show_counters_from_cache(show_info, counters)
+                    
+            except Exception as e:
+                print(f"{RED}Error processing user {username}: {e}{RESET}")
+                continue
+        
+        return self._normalize_all_counters(counters)
 
     # ------------------------------------------------------------------------
     # CACHING LOGIC
     # ------------------------------------------------------------------------
-    def _load_trakt_sync_cache(self) -> Set[int]:
-        if not os.path.exists(self.trakt_sync_cache_path):
-            return set()
-        try:
-            with open(self.trakt_sync_cache_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                synced_ids = set(data.get('synced_show_ids', []))
-                return synced_ids
-        except Exception as e:
-            print(f"{YELLOW}Error loading Trakt sync cache: {e}{RESET}")
-            return set()
-			
     def _save_watched_cache(self):
-        data = {
-            'watched_count': self.cached_watched_count,
-            'watched_show_ids': list(self._get_watched_show_ids()),
-            'watched_data_counters': self.watched_data_counters,
-            'plex_tmdb_cache': self.plex_tmdb_cache,
-            'tmdb_keywords_cache': self.tmdb_keywords_cache
-        }
         try:
+            if self.debug:
+                print(f"DEBUG: Saving cache with {len(self.plex_tmdb_cache)} TMDB IDs and {len(self.tmdb_keywords_cache)} keyword sets")
+            
+            cache_data = {
+                'watched_count': self.cached_watched_count,
+                'watched_data_counters': self.watched_data_counters,
+                'plex_tmdb_cache': {str(k): v for k, v in self.plex_tmdb_cache.items()},
+                'tmdb_keywords_cache': {str(k): v for k, v in self.tmdb_keywords_cache.items()},
+                'watched_show_ids': list(self.watched_show_ids),
+                'last_updated': datetime.now().isoformat()
+            }
+            
             with open(self.watched_cache_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4)
+                json.dump(cache_data, f, indent=4, ensure_ascii=False)
+                
+            if self.debug:
+                print(f"DEBUG: Cache saved successfully")
+                
         except Exception as e:
             print(f"{YELLOW}Error saving watched cache: {e}{RESET}")
-    
-    def _save_unwatched_cache(self):
-        data = {
-            'library_show_count': self.cached_library_show_count,
-            'unwatched_count': self.cached_unwatched_count,
-            'unwatched_show_details': self.cached_unwatched_shows
-        }
-        try:
-            with open(self.unwatched_cache_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4, cls=DateTimeEncoder)
-        except Exception as e:
-            print(f"{YELLOW}Error saving unwatched cache: {e}{RESET}")
 
     def _save_trakt_sync_cache(self):
         try:
@@ -346,15 +920,42 @@ class PlexTVRecommender:
                 }, f, indent=4)
         except Exception as e:
             print(f"{YELLOW}Error saving Trakt sync cache: {e}{RESET}")
-			
+
     def _save_cache(self):
         self._save_watched_cache()
-        self._save_unwatched_cache()
-        self._save_trakt_sync_cache()
 
-    def _get_watched_count(self) -> int:
-        return len(self._get_watched_show_ids())
-
+    def _process_show_counters_from_cache(self, show_info: Dict, counters: Dict) -> None:
+        try:
+            rating = float(show_info.get('user_rating', 0))
+            if not rating:
+                rating = float(show_info.get('audience_rating', 5.0))
+            rating = max(0, min(10, int(round(rating))))
+            multiplier = RATING_MULTIPLIERS.get(rating, 1.0)
+    
+            for genre in show_info.get('genres', []):
+                counters['genres'][genre] += multiplier
+            
+            if studio := show_info.get('studio'):
+                counters['studio'][studio.lower()] += multiplier
+                
+            for actor in show_info.get('cast', [])[:3]:
+                counters['actors'][actor] += multiplier
+                
+            if language := show_info.get('language'):
+                counters['languages'][language.lower()] += multiplier
+                
+            if tmdb_id := show_info.get('tmdb_id'):
+                show_id = next((k for k, v in self.show_cache.cache['shows'].items() 
+                              if v.get('title') == show_info['title'] and 
+                              v.get('year') == show_info.get('year')), None)
+                if show_id:
+                    self.plex_tmdb_cache[str(show_id)] = tmdb_id
+                    if keywords := show_info.get('tmdb_keywords', []):
+                        self.tmdb_keywords_cache[str(tmdb_id)] = keywords
+                        counters['tmdb_keywords'].update({k: multiplier for k in keywords})
+    
+        except Exception as e:
+            print(f"{YELLOW}Error processing counters for {show_info.get('title')}: {e}{RESET}")
     # ------------------------------------------------------------------------
     # PATH HANDLING
     # ------------------------------------------------------------------------
@@ -387,27 +988,226 @@ class PlexTVRecommender:
     # ------------------------------------------------------------------------
     # LIBRARY UTILITIES
     # ------------------------------------------------------------------------
-    def _get_library_shows_set(self) -> Set[int]:
+    def _get_library_shows_set(self) -> Set[tuple]:
         try:
             shows = self.plex.library.section(self.library_title)
-            return {show.ratingKey for show in shows.all()}
+            library_shows = set()
+            for show in shows.all():
+                # Handle both normal titles and titles with embedded years
+                title = show.title.lower()
+                year = show.year
+                
+                # Add normal version
+                library_shows.add((title, year))
+                
+                # Check for and strip embedded year pattern
+                year_match = re.search(r'\s*\((\d{4})\)$', title)
+                if year_match:
+                    clean_title = title.replace(year_match.group(0), '').strip()
+                    embedded_year = int(year_match.group(1))
+                    library_shows.add((clean_title, embedded_year))
+                
+            return library_shows
         except Exception as e:
             print(f"{RED}Error getting library shows: {e}{RESET}")
             return set()
 
-    def _get_watched_show_ids(self) -> Set[int]:
-        try:
-            shows_section = self.plex.library.section(self.library_title)
-            watched_episodes = shows_section.searchEpisodes(unwatched=False)
-            # Extract unique show IDs from watched episodes
-            return {ep.grandparentRatingKey for ep in watched_episodes}
-        except Exception as e:
-            print(f"{RED}Error getting watched episodes: {e}{RESET}")
-            return set()
-
     def _is_show_in_library(self, title: str, year: Optional[int]) -> bool:
-        return (title.lower(), year) in self.library_shows
+        if not title:
+            return False
+            
+        title_lower = title.lower()
+        
+        # Check for year in title and strip it if found
+        year_match = re.search(r'\s*\((\d{4})\)$', title_lower)
+        if year_match:
+            clean_title = title_lower.replace(year_match.group(0), '').strip()
+            embedded_year = int(year_match.group(1))
+            if (clean_title, embedded_year) in self.library_shows:
+                return True
+        
+        # Check both with and without year
+        if (title_lower, year) in self.library_shows:
+            return True
+            
+        # Check title-only matches
+        return any(lib_title == title_lower or 
+                  lib_title == f"{title_lower} ({year})" or
+                  lib_title.replace(f" ({year})", "") == title_lower 
+                  for lib_title, lib_year in self.library_shows)
 
+    def _process_show_counters(self, show, counters):
+        show_details = self.get_show_details(show)
+        
+        try:
+            rating = float(getattr(show, 'userRating', 0))
+        except (TypeError, ValueError):
+            try:
+                rating = float(getattr(show, 'audienceRating', 5.0))
+            except (TypeError, ValueError):
+                rating = 5.0
+    
+        rating = max(0, min(10, int(round(rating))))
+        multiplier = RATING_MULTIPLIERS.get(rating, 1.0)
+    
+        for genre in show_details.get('genres', []):
+            counters['genres'][genre] += multiplier
+        
+        if hasattr(show, 'studio') and show.studio:
+            counters['studio'][show.studio.lower()] += multiplier
+            
+        for actor in show_details.get('cast', [])[:3]:
+            counters['actors'][actor] += multiplier
+            
+        if language := show_details.get('language'):
+            counters['languages'][language] += multiplier
+            
+        for keyword in show_details.get('tmdb_keywords', []):
+            counters['tmdb_keywords'][keyword] += multiplier
+    
+        # Get TVDB IDs and watch dates for all watched episodes
+        try:
+            watched_episodes = [ep for ep in show.episodes() if ep.isWatched]
+            if watched_episodes:
+                
+                for episode in watched_episodes:
+                    episode.reload()
+                    
+                    if hasattr(episode, 'lastViewedAt') and hasattr(episode, 'guids'):
+                        if isinstance(episode.lastViewedAt, datetime):
+                            watched_at = episode.lastViewedAt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                        else:
+                            watched_at = datetime.fromtimestamp(int(episode.lastViewedAt)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                        
+                        for guid in episode.guids:
+                            if 'tvdb://' in guid.id:
+                                try:
+                                    episode_tvdb_id = int(guid.id.split('tvdb://')[1].split('?')[0])
+                                    if 'tvdb_ids' not in counters:
+                                        counters['tvdb_ids'] = set()
+                                    if 'watch_dates' not in counters:
+                                        counters['watch_dates'] = {}
+                                    counters['tvdb_ids'].add(episode_tvdb_id)
+                                    counters['watch_dates'][episode_tvdb_id] = watched_at
+                                    break
+                                except (ValueError, IndexError) as e:
+                                    print(f"DEBUG: Error parsing TVDB ID for episode of {show.title}: {e}")
+                                    continue
+        except Exception as e:
+            print(f"{YELLOW}Error getting episode TVDB IDs for {show.title}: {e}{RESET}")
+
+    def _normalize_counter(self, counter: Counter) -> Dict[str, float]:
+        if not counter:
+            return {}
+        
+        if self.normalize_counters:
+            max_value = max(counter.values()) if counter else 1
+            return {
+                k: round(0.5 + (math.log(v + 1) / math.log(max_value + 1)), 2) 
+                for k, v in counter.items()
+            }
+        else:
+            return {k: round(float(v), 2) for k, v in counter.items()}
+
+    def _normalize_all_counters(self, counters):
+        normalized = {
+            'genres': self._normalize_counter(counters['genres']),
+            'studio': self._normalize_counter(counters['studio']),
+            'actors': self._normalize_counter(counters['actors']),
+            'languages': self._normalize_counter(counters['languages']),
+            'tmdb_keywords': self._normalize_counter(counters['tmdb_keywords'])
+        }
+        
+        if 'tvdb_ids' in counters:
+            normalized['tvdb_ids'] = list(counters['tvdb_ids']) if isinstance(counters['tvdb_ids'], set) else counters['tvdb_ids']
+        if 'watch_dates' in counters:
+            normalized['watch_dates'] = counters['watch_dates']
+        
+        return normalized
+
+    def _get_library_imdb_ids(self) -> Set[str]:
+        imdb_ids = set()
+        try:
+            shows = self.plex.library.section(self.library_title).all()
+            for show in shows:
+                if hasattr(show, 'guids'):
+                    for guid in show.guids:
+                        if guid.id.startswith('imdb://'):
+                            imdb_ids.add(guid.id.replace('imdb://', ''))
+                            break
+        except Exception as e:
+            print(f"{YELLOW}Error retrieving IMDb IDs from library: {e}{RESET}")
+        return imdb_ids
+
+    def get_show_details(self, show) -> Dict:
+        try:
+            show.reload()
+            
+            imdb_id = None
+            audience_rating = 0
+            tmdb_keywords = []
+            
+            if hasattr(show, 'guids'):
+                for guid in show.guids:
+                    if 'imdb://' in guid.id:
+                        imdb_id = guid.id.replace('imdb://', '')
+                        break
+            
+            if self.show_rating and hasattr(show, 'ratings'):
+                for rating in show.ratings:
+                    if (getattr(rating, 'image', '') == 'imdb://image.rating' and 
+                        getattr(rating, 'type', '') == 'audience'):
+                        try:
+                            audience_rating = float(rating.value)
+                            break
+                        except (ValueError, AttributeError):
+                            pass
+                            
+            if self.use_tmdb_keywords and self.tmdb_api_key:
+                tmdb_id = self._get_plex_show_tmdb_id(show)
+                if tmdb_id:
+                    tmdb_keywords = list(self._get_tmdb_keywords_for_id(tmdb_id))
+            
+            show_info = {
+                'title': show.title,
+                'year': getattr(show, 'year', None),
+                'genres': self._extract_genres(show),
+                'summary': getattr(show, 'summary', ''),
+                'studio': getattr(show, 'studio', 'N/A'),
+                'language': self._get_show_language(show),
+                'imdb_id': imdb_id,
+                'ratings': {
+                    'audience_rating': audience_rating
+                } if audience_rating > 0 else {},
+                'cast': [],
+                'tmdb_keywords': tmdb_keywords
+            }
+            
+            if self.show_cast and hasattr(show, 'roles'):
+                show_info['cast'] = [r.tag for r in show.roles[:3]]
+                
+            return show_info
+                
+        except Exception as e:
+            print(f"{YELLOW}Error getting show details for {show.title}: {e}{RESET}")
+            return {}
+		
+    def _validate_watched_shows(self):
+        cleaned_ids = set()
+        for show_id in self.watched_show_ids:
+            try:
+                cleaned_ids.add(int(str(show_id)))
+            except (ValueError, TypeError):
+                print(f"{YELLOW}Invalid watched show ID found: {show_id}{RESET}")
+        self.watched_show_ids = cleaned_ids
+
+    def _refresh_watched_data(self):
+        if self.users['tautulli_users']:
+            self.watched_data = self._get_tautulli_watched_shows_data()
+        else:
+            self.watched_data = self._get_managed_users_watched_data()
+        self.watched_data_counters = self.watched_data
+        self._save_watched_cache()
     # ------------------------------------------------------------------------
     # TMDB HELPER METHODS
     # ------------------------------------------------------------------------
@@ -424,7 +1224,7 @@ class PlexTVRecommender:
             return resp.json().get('tv_results', [{}])[0].get('id')
         except Exception as e:
             print(f"{YELLOW}IMDb fallback failed: {e}{RESET}")
-            return Non
+            return None
 
     def _get_plex_show_tmdb_id(self, plex_show) -> Optional[int]:
         # Recursion guard and cache check
@@ -486,7 +1286,11 @@ class PlexTVRecommender:
             tmdb_id = self._get_tmdb_id_via_imdb(plex_show)
     
         # Update cache even if None to prevent repeat lookups
-        self.plex_tmdb_cache[plex_show.ratingKey] = tmdb_id
+        if tmdb_id:
+            if self.debug:
+                print(f"DEBUG: Adding TMDB ID {tmdb_id} to cache for {plex_show.title}")
+            self.plex_tmdb_cache[str(plex_show.ratingKey)] = tmdb_id
+            self._save_watched_cache()
         return tmdb_id
 
     def _get_plex_show_imdb_id(self, plex_show) -> Optional[str]:
@@ -531,18 +1335,20 @@ class PlexTVRecommender:
         except Exception as e:
             print(f"{YELLOW}Error fetching TMDB keywords for ID {tmdb_id}: {e}{RESET}")
 
-        self.tmdb_keywords_cache[tmdb_id] = list(kw_set)
+        if kw_set:
+            if self.debug:
+                print(f"DEBUG: Adding {len(kw_set)} keywords to cache for TMDB ID {tmdb_id}")
+            self.tmdb_keywords_cache[str(tmdb_id)] = list(kw_set)
+            self._save_watched_cache()
         return kw_set
 
     def _get_show_language(self, show) -> str:
-        """Get show's primary audio language from first episode"""
         try:
             episodes = show.episodes()
             if not episodes:
                 print(f"DEBUG: No episodes found")
                 return "N/A"
     
-            # Get and reload first episode
             episode = episodes[0]
             episode.reload()
             
@@ -587,71 +1393,6 @@ class PlexTVRecommender:
             print(f"DEBUG: Error extracting genres for {show.title}: {str(e)}")
         return genres
 
-    def _get_watched_shows_data(self) -> Dict:
-        print(f"\n{YELLOW}Fetching watched shows from Plex library...{RESET}")
-        genre_counter = Counter()
-        studio_counter = Counter()
-        actor_counter = Counter()
-        tmdb_keyword_counter = Counter()
-        language_counter = Counter()
-
-        try:
-            shows_section = self.plex.library.section(self.library_title)
-            watched_shows = shows_section.search(unwatched=False)
-            total_watched = len(watched_shows)
-
-            print(f"Found {total_watched} watched shows. Building frequency data...")
-            for i, show in enumerate(watched_shows, start=1):
-                self._show_progress("Analyzing watched shows", i, total_watched)
-
-                user_rating = getattr(show, 'userRating', None)
-                if user_rating is not None:
-                    rating_weight = float(user_rating) / 10.0
-                    rating_weight = min(max(rating_weight, 0.1), 1.0)
-                else:
-                    rating_weight = 0.5
-
-                if hasattr(show, 'genres') and show.genres:
-                    for g in show.genres:
-                        if isinstance(g, plexapi.media.Genre) and hasattr(g, 'tag'):
-                            genre_counter[g.tag.lower()] += rating_weight
-                        elif isinstance(g, str):
-                            genre_counter[g.lower()] += rating_weight
-
-                if hasattr(show, 'studio') and show.studio:
-                    studio_counter[show.studio.lower()] += rating_weight
-
-                if hasattr(show, 'roles') and show.roles:
-                    for a in show.roles:
-                        actor_counter[a.tag] += rating_weight
-
-                if self.show_language:
-                    try:
-                        language = self._get_show_language(show)
-                        language_counter[language.lower()] += rating_weight
-                    except Exception as e:
-                        print(f"{YELLOW}Error getting language for '{show.title}': {e}{RESET}")
-
-                if self.use_tmdb_keywords and self.tmdb_api_key:
-                    tmdb_id = self._get_plex_show_tmdb_id(show)
-                    if tmdb_id:
-                        keywords = self._get_tmdb_keywords_for_id(tmdb_id)
-                        for kw in keywords:
-                            tmdb_keyword_counter[kw] += rating_weight
-
-            print()
-
-        except plexapi.exceptions.BadRequest as e:
-            print(f"{RED}Error gathering watched shows data: {e}{RESET}")
-
-        return {
-            'genres': dict(genre_counter),
-            'studio': dict(studio_counter),
-            'actors': dict(actor_counter),
-            'tmdb_keywords': dict(tmdb_keyword_counter),
-            'languages': dict(language_counter)
-        }
-
     def _show_progress(self, prefix: str, current: int, total: int):
         pct = int((current / total) * 100)
         msg = f"\r{prefix}: {current}/{total} ({pct}%)"
@@ -663,288 +1404,562 @@ class PlexTVRecommender:
     # ------------------------------------------------------------------------
     # TRAKT SYNC: BATCHED
     # ------------------------------------------------------------------------
-    def _sync_plex_watched_to_trakt(self):
+    def _authenticate_trakt(self):
+        try:
+            response = requests.post(
+                'https://api.trakt.tv/oauth/device/code',
+                headers={'Content-Type': 'application/json'},
+                json={
+                    'client_id': self.config['trakt']['client_id'],
+                    'scope': 'write'
+                }
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                device_code = data['device_code']
+                user_code = data['user_code']
+                verification_url = data['verification_url']
+                
+                print(f"\n{GREEN}Please visit {verification_url} and enter code: {CYAN}{user_code}{RESET}")
+                print("Waiting for authentication...")
+                webbrowser.open(verification_url)
+                
+                poll_interval = data['interval']
+                expires_in = data['expires_in']
+                start_time = time.time()
+                
+                while time.time() - start_time < expires_in:
+                    time.sleep(poll_interval)
+                    token_response = requests.post(
+                        'https://api.trakt.tv/oauth/device/token',
+                        headers={'Content-Type': 'application/json'},
+                        json={
+                            'code': device_code,
+                            'client_id': self.config['trakt']['client_id'],
+                            'client_secret': self.config['trakt']['client_secret']
+                        }
+                    )
+                    
+                    if token_response.status_code == 200:
+                        token_data = token_response.json()
+                        self.config['trakt']['access_token'] = token_data['access_token']
+                        self.trakt_headers['Authorization'] = f"Bearer {token_data['access_token']}"
+                        
+                        with open(os.path.join(os.path.dirname(__file__), 'config.yml'), 'w') as f:
+                            yaml.dump(self.config, f)
+                            
+                        print(f"{GREEN}Successfully authenticated with Trakt!{RESET}")
+                        return
+                    elif token_response.status_code != 400:
+                        print(f"{RED}Error getting token: {token_response.status_code}{RESET}")
+                        return
+                print(f"{RED}Authentication timed out{RESET}")
+            else:
+                print(f"{RED}Error getting device code: {response.status_code}{RESET}")
+        except Exception as e:
+            print(f"{RED}Error during Trakt authentication: {e}{RESET}")
+
+    def _clear_trakt_watch_history(self):
+        print(f"\n{YELLOW}Clearing Trakt watch history...{RESET}")
+        trakt_ids = []
+        page = 1
+        per_page = 100  # Max allowed by Trakt API
+        history_found = False
+        
+        try:
+            while True:
+                response = requests.get(
+                    "https://api.trakt.tv/sync/history/shows",
+                    headers=self.trakt_headers,
+                    params={'page': page, 'limit': per_page}
+                )
+                if response.status_code != 200:
+                    print(f"{RED}Error fetching history: {response.status_code}{RESET}")
+                    break
+                
+                data = response.json()
+                if not data:
+                    break
+                
+                history_found = True
+                for item in data:
+                    if 'show' in item and 'ids' in item['show']:
+                        trakt_id = item['show']['ids'].get('trakt')
+                        if trakt_id:
+                            trakt_ids.append(trakt_id)
+                
+                page += 1
+    
+            if trakt_ids:
+                remove_payload = {
+                    "shows": [
+                        {"ids": {"trakt": tid}} for tid in trakt_ids
+                    ]
+                }
+                
+                remove_response = requests.post(
+                    "https://api.trakt.tv/sync/history/remove",
+                    headers=self.trakt_headers,
+                    json=remove_payload
+                )
+                
+                if remove_response.status_code == 200:
+                    deleted = remove_response.json().get('deleted', {}).get('shows', 0)                   
+
+                    if os.path.exists(self.trakt_sync_cache_path):
+                        try:
+                            os.remove(self.trakt_sync_cache_path)
+                            print(f"{GREEN}Cleared Trakt sync cache.{RESET}")
+                        except Exception as e:
+                            print(f"{YELLOW}Error removing Trakt sync cache: {e}{RESET}")
+                    else:
+                        print(f"{GREEN}No Trakt sync cache to clear.{RESET}")
+                else:
+                    print(f"{RED}Failed to remove history: {remove_response.status_code}{RESET}")
+                    print(f"Response: {remove_response.text}")
+            elif history_found:
+                print(f"{YELLOW}No show IDs found in Trakt history to clear.{RESET}")
+            else:
+                print(f"{GREEN}No Trakt history found to clear.{RESET}")
+                
+        except Exception as e:
+            print(f"{RED}Error clearing Trakt history: {e}{RESET}")
+
+    def _sync_watched_shows_to_trakt(self):
         if not self.sync_watch_history:
             return
     
-        print(f"{YELLOW}Checking Trakt sync status...{RESET}")
-        all_watched_show_ids = self._get_watched_show_ids()
-        shows_to_sync = list(all_watched_show_ids - self.synced_show_ids)
-        #print(f"DEBUG: Total watched shows: {len(all_watched_show_ids)}")
-        #print(f"DEBUG: Already synced shows: {len(self.synced_show_ids)}")
-        #print(f"DEBUG: Shows to sync: {len(shows_to_sync)}")
-    
-        if not shows_to_sync:
-            print(f"All watched shows already synced to Trakt.")
-            return
-    
-        chunk_size = 100
-        shows_section = self.plex.library.section(self.library_title)
-        total_shows = len(shows_to_sync)
-        synced_in_session = 0
-    
-        for chunk_start in range(0, total_shows, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, total_shows)
-            chunk = shows_to_sync[chunk_start:chunk_end]
-            chunk_payload = {"episodes": []}
-            chunk_successful_ids = set()
-            
-            print(f"\nProcessing chunk {chunk_start + 1} to {chunk_end} of {total_shows}")
-            
-            for i, show_id in enumerate(chunk, 1):
-                try:
-                    show = shows_section.fetchItem(show_id)
-                    progress = (chunk_start + i) / total_shows * 100
-                    print(f"\rProgress: {progress:.1f}%", end='', flush=True)
-                    
-                    all_episodes = show.episodes()
-                    watched_episodes = [ep for ep in all_episodes if ep.isWatched]
-                    
-                    if not watched_episodes:
-                        continue
-                        
-                    first_episode = watched_episodes[0]
-                    last_watched = getattr(first_episode, 'lastViewedAt', None)
-                    if not last_watched:
-                        continue
-    
-                    imdb_id = None
-                    tvdb_id = None
-                    if hasattr(show, 'guids'):
-                        for guid in show.guids:
-                            if 'imdb://' in guid.id:
-                                imdb_id = guid.id.replace('imdb://', '')
-                            elif 'tvdb://' in guid.id:
-                                tvdb_id = guid.id.replace('tvdb://', '')
-    
-                    episode_data = {
-                        "watched_at": last_watched.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        "ids": {
-                            "tvdb": tvdb_id,
-                            "imdb": imdb_id
+        print(f"\n{YELLOW}Starting Trakt watch history sync...{RESET}")
+        
+        # Load existing synced episode IDs from cache
+        previously_synced_ids = set()
+        if os.path.exists(self.trakt_sync_cache_path):
+            try:
+                with open(self.trakt_sync_cache_path, 'r') as f:
+                    cache_data = json.load(f)
+                    if 'synced_episode_ids' in cache_data:
+                        previously_synced_ids = set(int(id) for id in cache_data['synced_episode_ids'] if str(id).isdigit())
+                        print(f"Loaded previously synced episode IDs from cache")
+            except Exception as e:
+                print(f"{YELLOW}Error loading Trakt sync cache: {e}{RESET}")
+        
+        watched_episodes = []
+        
+        try:
+            if self.users['tautulli_users']:
+                # Get Tautulli history for watched episodes
+                user_ids = self._get_tautulli_user_ids()
+                
+                # First, get all watch history from Tautulli
+                all_history_items = []
+                for user_id in user_ids:
+                    start = 0
+                    while True:
+                        params = {
+                            'apikey': self.config['tautulli']['api_key'],
+                            'cmd': 'get_history',
+                            'media_type': 'episode',
+                            'user_id': user_id,
+                            'length': 1000,
+                            'start': start
                         }
-                    }
-    
-                    chunk_payload["episodes"].append(episode_data)
-                    chunk_successful_ids.add(show_id)
-                    
-                except Exception as e:
-                    print(f"\n{YELLOW}Error processing {show.title}: {e}{RESET}")
-                    continue
-    
-            if chunk_payload["episodes"]:
-                print(f"\nDEBUG: Sending chunk with {len(chunk_payload['episodes'])} episodes")
+                        
+                        try:
+                            response = requests.get(
+                                f"{self.config['tautulli']['url']}/api/v2", 
+                                params=params,
+                                timeout=30
+                            )
+                            
+                            response.raise_for_status()
+                            data = response.json()['response']['data']
+                            
+                            if isinstance(data, dict):
+                                history_items = data.get('data', [])
+                            else:
+                                history_items = data
+                            
+                            all_history_items.extend(history_items)
+                            
+                            # Check if we should continue to next page
+                            if len(history_items) < 1000:
+                                break
+                                
+                            start += len(history_items)
+                            
+                        except Exception as e:
+                            if self.debug:
+                                print(f"DEBUG: Error fetching Tautulli history: {e}")
+                            break
+                
+                print(f"Gathering episode data from {len(all_history_items)} history items...")
+                
+                # Group episodes by rating_key (episode ID)
+                episode_groups = {}
+                for item in all_history_items:
+                    if item.get('watched_status') == 1:
+                        key = item['rating_key']
+                        if key not in episode_groups:
+                            episode_groups[key] = item
+                        
+                # Process each unique episode with progress indicator
+                total_episodes = len(episode_groups)
+                for i, (key, item) in enumerate(episode_groups.items()):
+                    # Show progress every 10 episodes or for the first/last one
+                    if i == 0 or i == total_episodes-1 or (i+1) % 10 == 0:
+                        progress = int((i+1) / total_episodes * 100)
+                        sys.stdout.write(f"\rProcessing episodes: {i+1}/{total_episodes} ({progress}%)")
+                        sys.stdout.flush()
+                        
+                    try:
+                        # Get the actual episode from Plex to ensure correct TVDB ID
+                        episode = self.plex.fetchItem(int(key))
+                        
+                        # Extract TVDB ID directly from the episode's GUIDs
+                        tvdb_id = None
+                        if hasattr(episode, 'guids'):
+                            for guid in episode.guids:
+                                if 'tvdb://' in guid.id:
+                                    try:
+                                        # Extract the actual episode TVDB ID
+                                        tvdb_id = int(guid.id.split('tvdb://')[1].split('?')[0])
+                                        break
+                                    except (ValueError, IndexError):
+                                        continue
+                        
+                        if not tvdb_id:
+                            continue
+                        
+                        # Convert timestamp
+                        timestamp = int(item['date'])
+                        watched_date = datetime.fromtimestamp(timestamp)
+                        trakt_date = watched_date.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                        
+                        watched_episodes.append({
+                            'tvdb_id': tvdb_id,
+                            'show_title': item['grandparent_title'],
+                            'season': item['parent_media_index'],
+                            'episode': item['media_index'],
+                            'watched_at': trakt_date
+                        })
+                            
+                    except Exception as e:
+                        if self.debug:
+                            print(f"\nDEBUG: Error processing episode {item.get('full_title', 'Unknown')}: {e}")
+                        continue
+                
+                # Print newline after progress indicator
+                print("")
+                
+            else:
+                # Process each show's episodes with progress
+                print(f"Gathering episode data from {len(self.watched_show_ids)} watched shows...")
+                total_shows = len(self.watched_show_ids)
+                show_count = 0
+                episode_count = 0
+                
+                for show_id in self.watched_show_ids:
+                    show_count += 1
+                    try:
+                        show = self.plex.fetchItem(show_id)
+                        show_episodes = [ep for ep in show.episodes() if ep.isWatched]
+                        
+                        # Update progress
+                        progress = int(show_count / total_shows * 100)
+                        sys.stdout.write(f"\rProcessing shows: {show_count}/{total_shows} ({progress}%) - Found {episode_count} episodes")
+                        sys.stdout.flush()
+                        
+                        for episode in show_episodes:
+                            if hasattr(episode, 'guids'):
+                                # Extract TVDB ID directly from the episode's GUIDs
+                                tvdb_id = None
+                                for guid in episode.guids:
+                                    if 'tvdb://' in guid.id:
+                                        try:
+                                            tvdb_id = int(guid.id.split('tvdb://')[1].split('?')[0])
+                                            break
+                                        except (ValueError, IndexError):
+                                            continue
+                                
+                                if not tvdb_id:
+                                    continue
+                                    
+                                watched_at = None
+                                if hasattr(episode, 'lastViewedAt'):
+                                    if isinstance(episode.lastViewedAt, datetime):
+                                        watched_at = episode.lastViewedAt
+                                    else:
+                                        watched_at = datetime.fromtimestamp(int(episode.lastViewedAt))
+                                
+                                if not watched_at:
+                                    continue
+                                    
+                                watched_episodes.append({
+                                    'tvdb_id': tvdb_id,
+                                    'show_title': show.title,
+                                    'season': episode.seasonNumber,
+                                    'episode': episode.index,
+                                    'watched_at': watched_at.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                                })
+                                episode_count += 1
+                                
+                    except Exception as e:
+                        if self.debug:
+                            print(f"\nDEBUG: Error processing show {show_id}: {e}")
+                        continue
+                
+                # Print newline after progress indicator
+                print("")
+        
+            if not watched_episodes:
+                print(f"{YELLOW}No episodes found to sync to Trakt{RESET}")
+                return
+            
+            # Filter out already synced episodes
+            new_episodes = []
+            for episode in watched_episodes:
+                if episode['tvdb_id'] not in previously_synced_ids:
+                    new_episodes.append(episode)
+            
+            if not new_episodes:
+                print(f"{GREEN}All episodes already synced to Trakt{RESET}")
+                return
+            
+            print(f"Found {len(new_episodes)} new episodes to sync (out of {len(watched_episodes)} total)")
+            
+            # Sync only new episodes in batches
+            batch_size = 100
+            newly_synced = set()
+            batch_count = 0
+            total_batches = math.ceil(len(new_episodes) / batch_size)
+            
+            for i in range(0, len(new_episodes), batch_size):
+                batch_count += 1
+                batch = new_episodes[i:i+batch_size]
+                                
+                payload = {
+                    "episodes": [
+                        {
+                            "ids": {
+                                "tvdb": ep['tvdb_id']
+                            },
+                            "watched_at": ep['watched_at']
+                        }
+                        for ep in batch
+                    ]
+                }
+        
                 try:
                     response = requests.post(
                         "https://api.trakt.tv/sync/history",
                         headers=self.trakt_headers,
-                        json=chunk_payload
+                        json=payload,
+                        timeout=60
                     )
-                    print(f"DEBUG: Trakt API Response: {response.status_code}")
-                    print(f"DEBUG: Response content: {response.text[:200]}")
-                    response.raise_for_status()
-                    
-                    self.synced_show_ids.update(chunk_successful_ids)
-                    synced_in_session += len(chunk_successful_ids)
-                    print(f"\n{GREEN}Successfully synced chunk to Trakt{RESET}")
-                    self._save_trakt_sync_cache()
-                    
+                                    
+                    if response.status_code == 201:
+                        response_data = response.json()
+                        added_episodes = response_data.get('added', {}).get('episodes', 0)
+                        if added_episodes > 0:
+                            newly_synced.update(ep['tvdb_id'] for ep in batch)
+                            print(f"{GREEN}Successfully synced {added_episodes} episodes{RESET}")
+                        else:
+                            print(f"{YELLOW}Warning: No episodes were added in this batch{RESET}")
+                    else:
+                        print(f"{RED}Error syncing batch to Trakt: {response.status_code}{RESET}")
+                        print(f"Error response: {response.text}")
+        
+                    time.sleep(2)  # Respect rate limiting
+        
                 except Exception as e:
-                    print(f"\n{RED}Error syncing chunk to Trakt: {e}{RESET}")
+                    print(f"{RED}Error during Trakt sync: {e}{RESET}")
+                    time.sleep(2)
                     continue
-    
-        print(f"\n{GREEN}Sync complete. {synced_in_session} shows synced to Trakt.{RESET}")
-
-    def calculate_show_score(self, show) -> float:
+        
+            # Update and save Trakt sync cache - combine previously synced with newly synced
+            if newly_synced:
+                try:
+                    all_synced = previously_synced_ids.union(newly_synced)
+                    with open(self.trakt_sync_cache_path, 'w') as f:
+                        json.dump({
+                            'synced_episode_ids': list(all_synced),
+                            'last_sync': datetime.now().isoformat()
+                        }, f, indent=4)
+                except Exception as e:
+                    print(f"{RED}Error saving Trakt sync cache: {e}{RESET}")
+        except Exception as outer_e:
+            print(f"{RED}Unexpected error during Trakt sync process: {outer_e}{RESET}")
+            if self.debug:
+                import traceback
+                print(f"DEBUG: {traceback.format_exc()}")
+    # ------------------------------------------------------------------------
+    # CALCULATE SCORES
+    # ------------------------------------------------------------------------
+    def _calculate_similarity_from_cache(self, show_info: Dict) -> Tuple[float, Dict]:
         try:
-            user_genres = Counter(self.watched_data.get('genres', {}))
-            user_studio = Counter(self.watched_data.get('studio', {}))
-            user_acts = Counter(self.watched_data.get('actors', {}))
-            user_kws = Counter(self.watched_data.get('tmdb_keywords', {}))
-            user_langs = Counter(self.watched_data.get('languages', {}))
-    
-            weights = self.weights
             score = 0.0
-    
-            # Calculate maximum counts for normalization
-            max_genre_count = max(user_genres.values()) if user_genres else 1
-            max_studio_count = max(user_studio.values()) if user_studio else 1
-            max_actor_count = max(user_acts.values()) if user_acts else 1
-            max_keyword_count = max(user_kws.values()) if user_kws else 1
-            max_language_count = max(user_langs.values()) if user_langs else 1
+            score_breakdown = {
+                'genre_score': 0.0,
+                'studio_score': 0.0,
+                'actor_score': 0.0,
+                'language_score': 0.0,
+                'keyword_score': 0.0,
+                'details': {
+                    'genres': [],
+                    'studio': None,
+                    'actors': [],
+                    'language': None,
+                    'keywords': []
+                }
+            }
+            
+            weights = self.weights
+            user_prefs = {
+                'genres': Counter(self.watched_data.get('genres', {})),
+                'studio': Counter(self.watched_data.get('studio', {})),
+                'actors': Counter(self.watched_data.get('actors', {})),
+                'languages': Counter(self.watched_data.get('languages', {})),
+                'keywords': Counter(self.watched_data.get('tmdb_keywords', {}))
+            }
+            
+            max_counts = {
+                'genres': max(user_prefs['genres'].values()) if user_prefs['genres'] else 1,
+                'studio': max(user_prefs['studio'].values()) if user_prefs['studio'] else 1,
+                'actors': max(user_prefs['actors'].values()) if user_prefs['actors'] else 1,
+                'languages': max(user_prefs['languages'].values()) if user_prefs['languages'] else 1,
+                'keywords': max(user_prefs['keywords'].values()) if user_prefs['keywords'] else 1
+            }
     
             # Genre Score
-            show_genres = set(self._extract_genres(show))
+            show_genres = set(show_info.get('genres', []))
             if show_genres:
                 genre_scores = []
                 for genre in show_genres:
-                    genre_count = user_genres.get(genre, 0)
+                    genre_count = user_prefs['genres'].get(genre, 0)
                     if genre_count > 0:
-                        genre_scores.append(genre_count / max_genre_count)
+                        normalized_score = genre_count / max_counts['genres']
+                        genre_scores.append(normalized_score)
+                        score_breakdown['details']['genres'].append(
+                            f"{genre} (count: {genre_count}, norm: {round(normalized_score, 2)})"
+                        )
                 if genre_scores:
-                    score += (sum(genre_scores) / len(genre_scores)) * weights.get('genre_weight', 0.25)
+                    genre_final = (sum(genre_scores) / len(genre_scores)) * weights.get('genre_weight', 0.25)
+                    score += genre_final
+                    score_breakdown['genre_score'] = round(genre_final, 3)
     
-            # studio Score
-            if hasattr(show, 'studio') and show.studio:
-                studio_scores = []
-                for studio in show.studio:
-                    if hasattr(studio, 'tag') and studio.tag in user_studio:
-                        studio_scores.append(user_studio[studio.tag] / max_studio_count)
-                if studio_scores:
-                    score += (sum(studio_scores) / len(studio_scores)) * weights.get('studio_weight', 0.20)
+            # Studio Score
+            if show_info.get('studio') and show_info['studio'] != 'N/A':
+                studio_count = user_prefs['studio'].get(show_info['studio'].lower(), 0)
+                if studio_count > 0:
+                    normalized_score = studio_count / max_counts['studio']
+                    studio_final = normalized_score * weights.get('studio_weight', 0.20)
+                    score += studio_final
+                    score_breakdown['studio_score'] = round(studio_final, 3)
+                    score_breakdown['details']['studio'] = f"{show_info['studio']} (count: {studio_count}, norm: {round(normalized_score, 2)})"
     
             # Actor Score
-            if hasattr(show, 'roles') and show.roles:
+            show_cast = show_info.get('cast', [])
+            if show_cast:
                 actor_scores = []
                 matched_actors = 0
-                for actor in show.roles:
-                    if hasattr(actor, 'tag') and actor.tag in user_acts:
+                for actor in show_cast:
+                    actor_count = user_prefs['actors'].get(actor, 0)
+                    if actor_count > 0:
                         matched_actors += 1
-                        actor_scores.append(user_acts[actor.tag] / max_actor_count)
+                        normalized_score = actor_count / max_counts['actors']
+                        actor_scores.append(normalized_score)
+                        score_breakdown['details']['actors'].append(
+                            f"{actor} (count: {actor_count}, norm: {round(normalized_score, 2)})"
+                        )
                 if matched_actors > 0:
                     actor_score = sum(actor_scores) / matched_actors
                     if matched_actors > 3:
-                        actor_score *= (3 / matched_actors)  # Normalize if many matches
-                    score += actor_score * weights.get('actor_weight', 0.20)
+                        actor_score *= (3 / matched_actors)
+                    actor_final = actor_score * weights.get('actor_weight', 0.20)
+                    score += actor_final
+                    score_breakdown['actor_score'] = round(actor_final, 3)
     
             # Language Score
-            if self.show_language:
-                try:
-                    language = self._get_show_language(show)
-                    if language != "N/A":
-                        lang_count = user_langs.get(language.lower(), 0)
-                        if lang_count > 0:
-                            score += (lang_count / max_language_count) * weights.get('language_weight', 0.10)
-                except Exception as e:
-                    print(f"{YELLOW}Error calculating language score: {e}{RESET}")
+            show_language = show_info.get('language', 'N/A')
+            if show_language != 'N/A':
+                show_lang_lower = show_language.lower()
+                            
+                lang_count = user_prefs['languages'].get(show_lang_lower, 0)
+                
+                if lang_count > 0:
+                    normalized_score = lang_count / max_counts['languages']
+                    lang_final = normalized_score * weights.get('language_weight', 0.10)
+                    score += lang_final
+                    score_breakdown['language_score'] = round(lang_final, 3)
+                    score_breakdown['details']['language'] = f"{show_language} (count: {lang_count}, norm: {round(normalized_score, 2)})"
     
             # TMDB Keywords Score
-            if self.use_tmdb_keywords and self.tmdb_api_key:
-                tmdb_id = self._get_plex_show_tmdb_id(show)
-                if tmdb_id:
-                    keywords = self._get_tmdb_keywords_for_id(tmdb_id)
-                    keyword_scores = []
-                    for kw in keywords:
-                        count = user_kws.get(kw, 0)
-                        if count > 0:
-                            keyword_scores.append(count / max_keyword_count)
-                    if keyword_scores:
-                        score += (sum(keyword_scores) / len(keyword_scores)) * weights.get('keyword_weight', 0.25)
+            if self.use_tmdb_keywords and show_info.get('tmdb_keywords'):
+                keyword_scores = []
+                for kw in show_info['tmdb_keywords']:
+                    count = user_prefs['keywords'].get(kw, 0)
+                    if count > 0:
+                        normalized_score = count / max_counts['keywords']
+                        keyword_scores.append(normalized_score)
+                        score_breakdown['details']['keywords'].append(
+                            f"{kw} (count: {count}, norm: {round(normalized_score, 2)})"
+                        )
+                if keyword_scores:
+                    keyword_final = (sum(keyword_scores) / len(keyword_scores)) * weights.get('keyword_weight', 0.25)
+                    score += keyword_final
+                    score_breakdown['keyword_score'] = round(keyword_final, 3)
     
-            return score
+            return score, score_breakdown
     
         except Exception as e:
-            print(f"{YELLOW}Error calculating score for {show.title}: {e}{RESET}")
-            return 0.0
+            print(f"{YELLOW}Error calculating similarity score for {show_info.get('title', 'Unknown')}: {e}{RESET}")
+            return 0.0, score_breakdown
 
-    def get_show_details(self, show) -> Dict:
-        try:
-            show.reload()
-            
-            imdb_id = None
-            audience_rating = 0
-            tmdb_keywords = []
-            
-            if hasattr(show, 'guids'):
-                for guid in show.guids:
-                    if 'imdb://' in guid.id:
-                        imdb_id = guid.id.replace('imdb://', '')
-                        break
-            
-            if self.show_rating and hasattr(show, 'ratings'):
-                for rating in show.ratings:
-                    if (getattr(rating, 'image', '') == 'imdb://image.rating' and 
-                        getattr(rating, 'type', '') == 'audience'):
-                        try:
-                            audience_rating = float(rating.value)
-                            break
-                        except (ValueError, AttributeError):
-                            pass
-                            
-            if self.use_tmdb_keywords and self.tmdb_api_key:
-                tmdb_id = self._get_plex_show_tmdb_id(show)
-                if tmdb_id:
-                    tmdb_keywords = list(self._get_tmdb_keywords_for_id(tmdb_id))
-            
-            show_info = {
-                'title': show.title,
-                'year': getattr(show, 'year', None),
-                'genres': self._extract_genres(show),
-                'summary': getattr(show, 'summary', ''),
-                'studio': getattr(show, 'studio', 'N/A'),
-                'language': self._get_show_language(show),
-                'imdb_id': imdb_id,
-                'ratings': {
-                    'audience_rating': audience_rating
-                } if audience_rating > 0 else {},
-                'cast': [],
-                'tmdb_keywords': tmdb_keywords
-            }
-            
-            if self.show_cast and hasattr(show, 'roles'):
-                show_info['cast'] = [r.tag for r in show.roles[:3]]
-                
-            return show_info
-                
-        except Exception as e:
-            print(f"{YELLOW}Error getting show details for {show.title}: {e}{RESET}")
-            return {}
+    def _print_similarity_breakdown(self, show_info: Dict, score: float, breakdown: Dict):
+        """Print detailed breakdown of similarity score calculation"""
+        print(f"\n{CYAN}Similarity Score Breakdown for '{show_info['title']}'{RESET}")
+        print(f"Total Score: {round(score * 100, 1)}%")
+        print(f"├─ Genre Score: {round(breakdown['genre_score'] * 100, 1)}%")
+        if breakdown['details']['genres']:
+            print(f"│  └─ Matching genres: {', '.join(breakdown['details']['genres'])}")
+        print(f"├─ Studio Score: {round(breakdown['studio_score'] * 100, 1)}%")
+        if breakdown['details']['studio']:
+            print(f"│  └─ Studio match: {breakdown['details']['studio']}")
+        print(f"├─ Actor Score: {round(breakdown['actor_score'] * 100, 1)}%")
+        if breakdown['details']['actors']:
+            print(f"│  └─ Matching actors: {', '.join(breakdown['details']['actors'])}")
+        print(f"├─ Language Score: {round(breakdown['language_score'] * 100, 1)}%")
+        if breakdown['details']['language']:
+            print(f"│  └─ Language match: {breakdown['details']['language']}")
+        print(f"└─ Keyword Score: {round(breakdown['keyword_score'] * 100, 1)}%")
+        if breakdown['details']['keywords']:
+            print(f"   └─ Matching keywords: {', '.join(breakdown['details']['keywords'])}")
+        print("")
 
-    def get_unwatched_library_shows(self) -> List[Dict]:
-        print(f"\n{YELLOW}Fetching unwatched shows from Plex library...{RESET}")
-        
-        all_show_ids = self._get_library_shows_set()
-        watched_show_ids = self._get_watched_show_ids()
-        current_unwatched_count = len(all_show_ids) - len(watched_show_ids)
-        
-        if (os.path.exists(self.unwatched_cache_path) and 
-            self.cached_unwatched_count == current_unwatched_count and 
-            self.cached_unwatched_shows):
-            print("Unwatched shows count unchanged. Using cached data.")
-            return self.cached_unwatched_shows
-            
-        print(f"Found {current_unwatched_count} unwatched shows. Analyzing profiles...")
-        
-        unwatched_show_ids = all_show_ids - watched_show_ids
-        shows_section = self.plex.library.section(self.library_title)
-        
-        unwatched_details = []
-        excluded_count = 0
-        
-        for i, show_id in enumerate(unwatched_show_ids, start=1):
-            try:
-                show = shows_section.fetchItem(show_id)
-                self._show_progress("Scanning unwatched", i, current_unwatched_count)
-                
-                info = self.get_show_details(show)
-                show_genres = info.get('genres', [])
-                
-                if show_genres and any(g in self.exclude_genres for g in show_genres):
-                    excluded_count += 1
-                    continue
-                    
-                unwatched_details.append(info)
-                
-            except Exception as e:
-                print(f"\nDEBUG: Error processing show ID {show_id}:")
-                import traceback
-                traceback.print_exc()
-                continue
-    
-        print(f"\nProcessing complete:")
-        print(f"- Excluded shows due to genre: {excluded_count}")
-    
-        # Update cache
-        self.cached_library_show_count = len(all_show_ids)
-        self.cached_unwatched_count = current_unwatched_count
-        self.cached_unwatched_shows = unwatched_details
-        self._save_unwatched_cache()
-        
-        return unwatched_details
-
+    # ------------------------------------------------------------------------
+    # GET RECOMMENDATIONS
+    # ------------------------------------------------------------------------
     def get_trakt_recommendations(self) -> List[Dict]:
-        print(f"\n{YELLOW}Fetching recommendations from Trakt...{RESET}")
+        print(f"\n{YELLOW}Checking Trakt recommendations...{RESET}")
         try:
+            # First check if there's any watch history
+            history_response = requests.get(
+                "https://api.trakt.tv/sync/history/shows",
+                headers=self.trakt_headers,
+                params={'limit': 1}
+            )
+            
+            if history_response.status_code == 200:
+                if not history_response.json():
+                    print(f"{YELLOW}No watch history found on Trakt. Skipping recommendations.{RESET}")
+                    return []
+            else:
+                print(f"{RED}Error checking Trakt history: {history_response.status_code}{RESET}")
+                return []
+    
+            # If we have history, proceed with getting recommendations
+            print(f"Fetching recommendations from Trakt...")
             url = "https://api.trakt.tv/recommendations/tv"
             collected_recs = []
             page = 1
@@ -983,18 +1998,15 @@ class PlexTVRecommender:
                     for s in shows:
                         if len(collected_recs) >= self.limit_trakt_results:
                             break
-    
+                
                         show = s.get('show', {})
                         if not show:
                             continue
-    
+                
                         title = show.get('title', '').strip()
                         year = show.get('year', None)
-    
-                        if not title:
-                            continue
-    
-                        if self._is_show_in_library(title, year):
+                
+                        if not title or self._is_show_in_library(title, year):
                             continue
     
                         ratings = {
@@ -1045,10 +2057,6 @@ class PlexTVRecommender:
                                         c_sorted = c_data['cast'][:3]
                                         sd['cast'] = [c['name'] for c in c_sorted]
     
-                                    if self.show_studio and 'crew' in c_data:
-                                        studio = [p for p in c_data['crew'] if p.get('job') == 'studio']
-                                        if studio:
-                                            sd['studio'] = studio[0]['name']
                                 except Exception as e:
                                     print(f"{YELLOW}Error fetching credits for '{title}': {e}{RESET}")
     
@@ -1069,7 +2077,6 @@ class PlexTVRecommender:
             collected_recs.sort(key=lambda x: x.get('ratings', {}).get('audience_rating', 0), reverse=True)
             random.shuffle(collected_recs)
             final_recs = collected_recs[:self.limit_trakt_results]
-            print(f"Collected {len(final_recs)} Trakt recommendations after exclusions.")
             return final_recs
     
         except Exception as e:
@@ -1077,51 +2084,96 @@ class PlexTVRecommender:
             return []
 
     def get_recommendations(self) -> Dict[str, List[Dict]]:
-        if self.sync_watch_history:
-            self._sync_plex_watched_to_trakt()
-            self._save_cache()
-    
-        plex_recs = self.get_unwatched_library_shows()
-        if plex_recs:
-            excluded_recs = [s for s in plex_recs if any(g in self.exclude_genres for g in s['genres'])]
-            included_recs = [s for s in plex_recs if not any(g in self.exclude_genres for g in s['genres'])]
-
-            if not included_recs:
-                print(f"{YELLOW}No unwatched shows left after applying genre exclusions.{RESET}")
-                plex_recs = []
+        if self.cached_watched_count > 0 and not self.watched_show_ids:
+            if self.users['tautulli_users']:
+                self.watched_data = self._get_tautulli_watched_shows_data()
             else:
-                plex_recs = included_recs
-                plex_recs.sort(
-                    key=lambda x: (
-                        x.get('ratings', {}).get('audience_rating', 0),
-                        x.get('similarity_score', 0)
-                    ),
-                    reverse=True
-                )
-                top_count = max(int(len(plex_recs) * 0.5), self.limit_plex_results)
-                top_by_rating = plex_recs[:top_count]
-
-                top_by_rating.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
-                final_count = max(int(len(top_by_rating) * 0.3), self.limit_plex_results)
-                final_pool = top_by_rating[:final_count]
-
-                if final_pool:
-                    plex_recs = random.sample(final_pool, min(self.limit_plex_results, len(final_pool)))
-                else:
-                    plex_recs = []
-        else:
+                self.watched_data = self._get_managed_users_watched_data()
+            self.watched_data_counters = self.watched_data
+            self._save_watched_cache()
+        
+        trakt_config = self.config.get('trakt', {})        
+        
+        # Handle Trakt operations if configured AND plex_only is not enabled
+        if not self.plex_only:
+            if trakt_config.get('clear_watch_history', False):
+                self._clear_trakt_watch_history()
+            if self.sync_watch_history:
+                self._sync_watched_shows_to_trakt()
+                self._save_cache()
+    
+        # Get all shows from cache
+        all_shows = self.show_cache.cache['shows']
+        
+        print(f"\n{YELLOW}Processing recommendations...{RESET}")
+        
+        # Filter out watched shows and excluded genres
+        unwatched_shows = []
+        excluded_count = 0
+        
+        for show_id, show_info in all_shows.items():
+            # Skip if show is watched
+            if int(str(show_id)) in self.watched_show_ids:
+                continue
+                
+            # Skip if show has excluded genres
+            if any(g in self.exclude_genres for g in show_info.get('genres', [])):
+                excluded_count += 1
+                continue
+                
+            unwatched_shows.append(show_info)
+    
+        if excluded_count > 0:
+            print(f"Excluded {excluded_count} shows based on genre filters")
+    
+        if not unwatched_shows:
+            print(f"{YELLOW}No unwatched shows found matching your criteria.{RESET}")
             plex_recs = []
-
+        else:
+            print(f"Calculating similarity scores for {len(unwatched_shows)} shows...")
+            
+            # Calculate similarity scores
+            scored_shows = []
+            for i, show_info in enumerate(unwatched_shows, 1):
+                self._show_progress("Processing", i, len(unwatched_shows))
+                try:
+                    similarity_score, breakdown = self._calculate_similarity_from_cache(show_info)
+                    show_info['similarity_score'] = similarity_score
+                    show_info['score_breakdown'] = breakdown
+                    scored_shows.append(show_info)
+                except Exception as e:
+                    print(f"{YELLOW}Error processing {show_info['title']}: {e}{RESET}")
+                    continue
+            
+            # Sort by similarity score
+            scored_shows.sort(key=lambda x: x['similarity_score'], reverse=True)
+            
+            if self.randomize_recommendations:
+                # Take top 10% of shows by similarity score and randomize
+                top_count = max(int(len(scored_shows) * 0.1), self.limit_plex_results)
+                top_pool = scored_shows[:top_count]
+                plex_recs = random.sample(top_pool, min(self.limit_plex_results, len(top_pool)))
+            else:
+                # Take top shows directly by similarity score
+                plex_recs = scored_shows[:self.limit_plex_results]
+            
+            # Print detailed breakdowns for final recommendations if debug is enabled
+            if self.debug:
+                print(f"\n{GREEN}=== Similarity Score Breakdowns for Recommendations ==={RESET}")
+                for show in plex_recs:
+                    self._print_similarity_breakdown(show, show['similarity_score'], show['score_breakdown'])
+    
+        # Get Trakt recommendations if enabled
         trakt_recs = []
         if not self.plex_only:
             trakt_recs = self.get_trakt_recommendations()
-
+    
         print(f"\nRecommendation process completed!")
         return {
             'plex_recommendations': plex_recs,
             'trakt_recommendations': trakt_recs
         }
-
+    
     def _user_select_recommendations(self, recommended_shows: List[Dict], operation_label: str) -> List[Dict]:
         prompt = (
             f"\nWhich recommendations would you like to {operation_label}?\n"
@@ -1164,21 +2216,40 @@ class PlexTVRecommender:
         if not recommended_shows:
             print(f"{YELLOW}No shows to add labels to.{RESET}")
             return
-
+    
         if not self.config['plex'].get('add_label'):
             return
-
+    
         if self.confirm_operations:
             selected_shows = self._user_select_recommendations(recommended_shows, "label in Plex")
             if not selected_shows:
                 return
         else:
             selected_shows = recommended_shows
-
+    
         try:
             shows_section = self.plex.library.section(self.library_title)
             label_name = self.config['plex'].get('label_name', 'Recommended')
-
+    
+            # Handle username appending for labels
+            if self.config['plex'].get('append_usernames', False):
+                if self.single_user:
+                    # For single user mode, only append the current user
+                    user_suffix = re.sub(r'\W+', '_', self.single_user.strip())
+                    label_name = f"{label_name}_{user_suffix}"
+                else:
+                    # For combined mode, append all users
+                    users = []
+                    if self.users['tautulli_users']:
+                        users = self.users['tautulli_users']
+                    else:
+                        users = self.users['managed_users']
+                    
+                    if users:
+                        sanitized_users = [re.sub(r'\W+', '_', user.strip()) for user in users]
+                        user_suffix = '_'.join(sanitized_users)
+                        label_name = f"{label_name}_{user_suffix}"
+    
             shows_to_update = []
             for rec in selected_shows:
                 plex_show = next(
@@ -1189,11 +2260,11 @@ class PlexTVRecommender:
                 if plex_show:
                     plex_show.reload()
                     shows_to_update.append(plex_show)
-
+    
             if not shows_to_update:
                 print(f"{YELLOW}No matching shows found in Plex to add labels to.{RESET}")
                 return
-
+    
             if self.config['plex'].get('remove_previous_recommendations', False):
                 print(f"{YELLOW}Finding shows with existing label: {label_name}{RESET}")
                 labeled_shows = set(shows_section.search(label=label_name))
@@ -1203,7 +2274,7 @@ class PlexTVRecommender:
                     if label_name in current_labels:
                         show.removeLabel(label_name)
                         print(f"{YELLOW}Removed label from: {show.title}{RESET}")
-
+    
             print(f"{YELLOW}Adding label to recommended shows...{RESET}")
             for show in shows_to_update:
                 current_labels = [label.tag for label in show.labels]
@@ -1212,14 +2283,17 @@ class PlexTVRecommender:
                     print(f"{GREEN}Added label to: {show.title}{RESET}")
                 else:
                     print(f"{YELLOW}Label already exists on: {show.title}{RESET}")
-
+    
             print(f"{GREEN}Successfully updated labels for recommended shows{RESET}")
-
+    
         except Exception as e:
             print(f"{RED}Error managing Plex labels: {e}{RESET}")
             import traceback
             print(traceback.format_exc())
 
+    # ------------------------------------------------------------------------
+    # SONARR
+    # ------------------------------------------------------------------------
     def add_to_sonarr(self, recommended_shows: List[Dict]) -> None:
         if not recommended_shows:
             print(f"{YELLOW}No shows to add to Sonarr.{RESET}")
@@ -1228,9 +2302,10 @@ class PlexTVRecommender:
         if not self.sonarr_config.get('add_to_sonarr'):
             return
     
-        valid_options = ['all', 'none', 'firstseason']
+        valid_options = ['all', 'none', 'firstSeason']
         monitor_option = self.sonarr_config.get('monitor_option', 'all')
         search_missing = self.sonarr_config.get('search_missing', False)
+        season_folder = self.sonarr_config.get('seasonFolder', True)
         
         if monitor_option not in valid_options:
             print(f"{RED}Invalid monitor_option '{monitor_option}'. Using 'all'{RESET}")
@@ -1246,10 +2321,12 @@ class PlexTVRecommender:
                 choice = input(f"Choose monitoring [default: {monitor_option}]: ").strip().lower()
                 if not choice:
                     break
-                if choice in valid_options:
-                    monitor_option = choice
+                if choice in [opt.lower() for opt in valid_options]:
+                    monitor_option = next(opt for opt in valid_options if opt.lower() == choice)
                     break
                 print(f"{RED}Invalid option. Valid choices: {', '.join(valid_options)}{RESET}")
+        else:
+            selected_shows = recommended_shows
     
         try:
             if 'sonarr' not in self.config:
@@ -1278,20 +2355,44 @@ class PlexTVRecommender:
     
             tag_id = None
             if self.sonarr_config.get('sonarr_tag'):
+                # Get the base tag name
+                tag_name = self.sonarr_config['sonarr_tag']
+                
+                # Handle username appending for Sonarr tags if enabled
+                if self.sonarr_config.get('append_usernames', False):
+                    if self.single_user:
+                        # For single user mode, only append the current user
+                        user_suffix = re.sub(r'\W+', '_', self.single_user.strip())
+                        tag_name = f"{tag_name}_{user_suffix}"
+                    else:
+                        # For combined mode, append all users
+                        users = []
+                        if self.users['tautulli_users']:
+                            users = self.users['tautulli_users']
+                        else:
+                            users = self.users['managed_users']
+                        
+                        if users:
+                            sanitized_users = [re.sub(r'\W+', '_', user.strip()) for user in users]
+                            user_suffix = '_'.join(sanitized_users)
+                            tag_name = f"{tag_name}_{user_suffix}"
+                
+                # Get or create the tag in Sonarr
                 tags_response = requests.get(f"{sonarr_url}/tag", headers=headers)
                 tags_response.raise_for_status()
                 tags = tags_response.json()
-                tag = next((t for t in tags if t['label'].lower() == self.sonarr_config['sonarr_tag'].lower()), None)
+                tag = next((t for t in tags if t['label'].lower() == tag_name.lower()), None)
                 if tag:
                     tag_id = tag['id']
                 else:
                     tag_response = requests.post(
                         f"{sonarr_url}/tag",
                         headers=headers,
-                        json={'label': self.sonarr_config['sonarr_tag']}
+                        json={'label': tag_name}
                     )
                     tag_response.raise_for_status()
                     tag_id = tag_response.json()['id']
+                    print(f"{GREEN}Created new Sonarr tag: {tag_name}{RESET}")
     
             profiles_response = requests.get(f"{sonarr_url}/qualityprofile", headers=headers)
             profiles_response.raise_for_status()
@@ -1356,9 +2457,95 @@ class PlexTVRecommender:
                         continue
     
                     if tvdb_id in existing_tvdb_ids:
-                        print(f"{YELLOW}Already in Sonarr: {show['title']}{RESET}")
-                        continue
+                        # Find the existing show
+                        existing_show = next(s for s in existing_shows if s['tvdbId'] == tvdb_id)
+                        
+                        # Get the full series data from Sonarr regardless of monitoring option
+                        try:
+                            series_response = requests.get(
+                                f"{sonarr_url}/series/{existing_show['id']}", 
+                                headers=headers
+                            )
+                            series_response.raise_for_status()
+                            current_series = series_response.json()
+                            
+                            # Check if we need to update tags
+                            needs_tag_update = tag_id is not None and tag_id not in current_series.get('tags', [])
+                            
+                            # If monitoring is enabled or we need to add a tag
+                            if monitor_option != 'none' or needs_tag_update:
+                                print(f"{YELLOW}Show already in Sonarr: {show['title']}{RESET}")
+                                
+                                update_data = current_series.copy()
+                                
+                                # Add the configured tag if it exists and isn't already added
+                                if needs_tag_update:
+                                    if 'tags' not in update_data:
+                                        update_data['tags'] = []
+                                    update_data['tags'].append(tag_id)
+                                    print(f"{GREEN}Adding tag '{self.sonarr_config.get('sonarr_tag')}' to {show['title']}{RESET}")
+                                
+                                # Update monitoring only if monitoring option is not 'none'
+                                if monitor_option != 'none':
+                                    print(f"{GREEN}Updating monitoring status...{RESET}")
+                                    update_data['monitored'] = True
+                                    
+                                    # Update season monitoring based on monitor_option
+                                    if 'seasons' in current_series:
+                                        update_data['seasons'] = [
+                                            {
+                                                'seasonNumber': season['seasonNumber'],
+                                                'monitored': (
+                                                    monitor_option == 'all' or 
+                                                    (monitor_option == 'firstSeason' and season['seasonNumber'] == 1)
+                                                ),
+                                                'statistics': season.get('statistics', {}),
+                                            }
+                                            for season in current_series['seasons']
+                                            if season['seasonNumber'] != 0  # Exclude specials
+                                        ]
+                                
+                                # Update the show in Sonarr
+                                update_resp = requests.put(
+                                    f"{sonarr_url}/series/{existing_show['id']}", 
+                                    headers=headers, 
+                                    json=update_data
+                                )
+                                update_resp.raise_for_status()
+                                
+                                if monitor_option != 'none':
+                                    monitoring_message = 'all seasons' if monitor_option == 'all' else 'first season'
+                                    print(f"{GREEN}Updated show and {monitoring_message} monitoring for: {show['title']}{RESET}")
+                                
+                                # If search_missing is enabled and monitoring is updated, trigger a search
+                                if search_missing and monitor_option != 'none':
+                                    search_cmd = {
+                                        'name': 'MissingEpisodeSearch',
+                                        'seriesId': existing_show['id']
+                                    }
+                                    sr = requests.post(f"{sonarr_url}/command", headers=headers, json=search_cmd)
+                                    sr.raise_for_status()
+                                    print(f"{GREEN}Triggered search for: {show['title']}{RESET}")
+                            else:
+                                print(f"{YELLOW}Already in Sonarr: {show['title']}{RESET}")
+                            
+                            # Skip to next show after handling the existing one
+                            continue
+                                
+                        except requests.exceptions.RequestException as e:
+                            print(f"{RED}Error updating {show['title']} in Sonarr: {str(e)}{RESET}")
+                            if hasattr(e, 'response') and e.response is not None:
+                                try:
+                                    error_details = e.response.json()
+                                    print(f"{RED}Sonarr error details: {json.dumps(error_details, indent=2)}{RESET}")
+                                except:
+                                    print(f"{RED}Sonarr error response: {e.response.text}{RESET}")
+                            continue
+                        else:
+                            print(f"{YELLOW}Already in Sonarr: {show['title']}{RESET}")
+                            continue
     
+                    # Handle new show addition
                     seasons = []
                     if monitor_option == 'firstSeason':
                         try:
@@ -1386,15 +2573,15 @@ class PlexTVRecommender:
                         'tvdbId': tvdb_id,
                         'title': show['title'],
                         'qualityProfileId': quality_profile_id,
-                        'seasonFolder': True,
+                        'seasonFolder': season_folder,
                         'rootFolderPath': root_folder,
-                        'monitored': monitor_option != 'none',
+                        'monitored': True,
                         'addOptions': {
                             'searchForMissingEpisodes': search_missing,
-                            'monitor': monitor_option if monitor_option != 'firstSeason' else 'none'
+                            'monitor': monitor_option
                         }
                     }
-    
+                    
                     if seasons:
                         show_data['seasons'] = seasons
                     elif monitor_option == 'firstSeason':
@@ -1412,10 +2599,12 @@ class PlexTVRecommender:
                         search_cmd = {'name': 'SeriesSearch', 'seriesIds': [new_id]}
                         sr = requests.post(f"{sonarr_url}/command", headers=headers, json=search_cmd)
                         sr.raise_for_status()
-                        print(f"Triggered download search for: {show['title']}")
+                        print(f"{GREEN}Added and triggered download search for: {show['title']}{RESET}")
+                    else:
+                        print(f"{GREEN}Added: {show['title']}{RESET}")
     
                 except requests.exceptions.RequestException as e:
-                    print(f"{RED}Error adding {show['title']} to Sonarr: {str(e)}{RESET}")
+                    print(f"{RED}Error processing {show['title']}: {str(e)}{RESET}")
                     if hasattr(e, 'response') and e.response is not None:
                         try:
                             error_details = e.response.json()
@@ -1436,13 +2625,16 @@ def format_show_output(show: Dict,
                       show_summary: bool = False,
                       index: Optional[int] = None,
                       show_cast: bool = False,
-                      show_studio: bool = False,
                       show_language: bool = False,
                       show_rating: bool = False,
                       show_imdb_link: bool = False) -> str:
     bullet = f"{index}. " if index is not None else "- "
     output = f"{bullet}{CYAN}{show['title']}{RESET} ({show.get('year', 'N/A')})"
-    
+
+    if 'similarity_score' in show:
+        score_percentage = round(show['similarity_score'] * 100, 1)
+        output += f" - Similarity: {YELLOW}{score_percentage}%{RESET}"
+		
     if show.get('genres'):
         output += f"\n  {YELLOW}Genres:{RESET} {', '.join(show['genres'])}"
 
@@ -1451,9 +2643,6 @@ def format_show_output(show: Dict,
 
     if show_cast and show.get('cast'):
         output += f"\n  {YELLOW}Cast:{RESET} {', '.join(show['cast'])}"
-
-    if show_studio and show.get('studio') != "N/A":
-        output += f"\n  {YELLOW}Studio:{RESET} {show['studio']}"
 
     if show_language and show.get('language') != "N/A":
         output += f"\n  {YELLOW}Language:{RESET} {show['language']}"
@@ -1476,18 +2665,42 @@ ANSI_PATTERN = re.compile(r'\x1b\[[0-9;]*m')
 class TeeLogger:
     """
     A simple 'tee' class that writes to both console and a file,
-    stripping ANSI color codes for the file.
+    stripping ANSI color codes for the file and handling Unicode characters.
     """
     def __init__(self, logfile):
         self.logfile = logfile
+        # Force UTF-8 encoding for stdout
+        if hasattr(sys.stdout, 'buffer'):
+            self.stdout_buffer = sys.stdout.buffer
+        else:
+            self.stdout_buffer = sys.stdout
     
     def write(self, text):
-        sys.__stdout__.write(text)
-        stripped = ANSI_PATTERN.sub('', text)
-        self.logfile.write(stripped)
+        try:
+            # Write to console
+            if hasattr(sys.stdout, 'buffer'):
+                self.stdout_buffer.write(text.encode('utf-8'))
+            else:
+                sys.__stdout__.write(text)
+            
+            # Write to file (strip ANSI codes)
+            stripped = ANSI_PATTERN.sub('', text)
+            self.logfile.write(stripped)
+        except UnicodeEncodeError:
+            # Fallback for problematic characters
+            safe_text = text.encode('ascii', 'replace').decode('ascii')
+            if hasattr(sys.stdout, 'buffer'):
+                self.stdout_buffer.write(safe_text.encode('utf-8'))
+            else:
+                sys.__stdout__.write(safe_text)
+            stripped = ANSI_PATTERN.sub('', safe_text)
+            self.logfile.write(stripped)
     
     def flush(self):
-        sys.__stdout__.flush()
+        if hasattr(sys.stdout, 'buffer'):
+            self.stdout_buffer.flush()
+        else:
+            sys.__stdout__.flush()
         self.logfile.flush()
 
 def cleanup_old_logs(log_dir: str, keep_logs: int):
@@ -1524,23 +2737,84 @@ def main():
 
     general = base_config.get('general', {})
     keep_logs = general.get('keep_logs', 0)
+    combine_watch_history = general.get('combine_watch_history', True)
 
+    # Get all users that need to be processed
+    all_users = []
+    tautulli_config = base_config.get('tautulli', {})
+    tautulli_users = tautulli_config.get('users')
+    
+    # Check if Tautulli is configured and users are not 'none'
+    if tautulli_users and str(tautulli_users).lower() != 'none':
+        # Process Tautulli users
+        if isinstance(tautulli_users, str):
+            all_users = [u.strip() for u in tautulli_users.split(',') if u.strip()]
+        elif isinstance(tautulli_users, list):
+            all_users = tautulli_users
+    else:
+        # Fall back to managed users if Tautulli is not configured or users is 'none'
+        managed_users = base_config['plex'].get('managed_users', '')
+        all_users = [u.strip() for u in managed_users.split(',') if u.strip()]
+
+    if combine_watch_history or not all_users:
+        # Original behavior - single run
+        process_recommendations(base_config, config_path, keep_logs)
+    else:
+        # Individual runs for each user
+        for user in all_users:
+            print(f"\n{GREEN}Processing recommendations for user: {user}{RESET}")
+            print("-" * 50)
+            
+            # Create modified config for this user
+            user_config = copy.deepcopy(base_config)
+            
+            # Resolve Admin to actual username if needed
+            resolved_user = user
+            try:
+                account = MyPlexAccount(token=base_config['plex']['token'])
+                admin_username = account.username
+                if user.lower() in ['admin', 'administrator']:
+                    resolved_user = admin_username
+                    print(f"{YELLOW}Resolved Admin to: {admin_username}{RESET}")
+            except Exception as e:
+                print(f"{YELLOW}Could not resolve admin username: {e}{RESET}")
+            
+            if 'managed_users' in user_config['plex']:
+                user_config['plex']['managed_users'] = resolved_user
+            elif 'users' in user_config.get('tautulli', {}):
+                user_config['tautulli']['users'] = [resolved_user]
+            
+            # Process recommendations for this user
+            process_recommendations(user_config, config_path, keep_logs, single_user=resolved_user)
+            print(f"\n{GREEN}Completed processing for user: {resolved_user}{RESET}")
+            print("-" * 50)
+
+    runtime = datetime.now() - start_time
+    hours = runtime.seconds // 3600
+    minutes = (runtime.seconds % 3600) // 60
+    seconds = runtime.seconds % 60
+    print(f"\n{GREEN}All processing completed!{RESET}")
+    print(f"Total runtime: {hours:02d}:{minutes:02d}:{seconds:02d}")
+
+def process_recommendations(config, config_path, keep_logs, single_user=None):
     original_stdout = sys.stdout
     log_dir = os.path.join(os.path.dirname(__file__), 'Logs')
+    
     if keep_logs > 0:
         try:
             os.makedirs(log_dir, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            log_file_path = os.path.join(log_dir, f"recommendations_{timestamp}.log")
+            user_suffix = f"_{single_user}" if single_user else ""
+            log_file_path = os.path.join(log_dir, f"recommendations{user_suffix}_{timestamp}.log")
             lf = open(log_file_path, "w", encoding="utf-8")
             sys.stdout = TeeLogger(lf)
-
             cleanup_old_logs(log_dir, keep_logs)
         except Exception as e:
             print(f"{RED}Could not set up logging: {e}{RESET}")
 
     try:
-        recommender = PlexTVRecommender(config_path)
+        # Create recommender with single user context
+        recommender = PlexTVRecommender(config_path, single_user)
         recommendations = recommender.get_recommendations()
         
         print(f"\n{GREEN}=== Recommended Unwatched Shows in Your Library ==={RESET}")
@@ -1552,7 +2826,6 @@ def main():
                     show_summary=recommender.show_summary,
                     index=i,
                     show_cast=recommender.show_cast,
-                    show_studio=recommender.show_studio,
                     show_language=recommender.show_language,
                     show_rating=recommender.show_rating,
                     show_imdb_link=recommender.show_imdb_link
@@ -1572,7 +2845,6 @@ def main():
                         show_summary=recommender.show_summary,
                         index=i,
                         show_cast=recommender.show_cast,
-                        show_studio=recommender.show_studio,
                         show_language=recommender.show_language,
                         show_rating=recommender.show_rating,
                         show_imdb_link=recommender.show_imdb_link
@@ -1588,19 +2860,12 @@ def main():
         print(traceback.format_exc())
 
     finally:
-        print(f"\n{GREEN}Process completed!{RESET}")
-        runtime = datetime.now() - start_time
-        hours = runtime.seconds // 3600
-        minutes = (runtime.seconds % 3600) // 60
-        seconds = runtime.seconds % 60
-        print(f"Total runtime: {hours:02d}:{minutes:02d}:{seconds:02d}")
-
-    if keep_logs > 0 and sys.stdout is not original_stdout:
-        try:
-            sys.stdout.logfile.close()
-            sys.stdout = original_stdout
-        except Exception as e:
-            print(f"{YELLOW}Error closing log file: {e}{RESET}") 
+        if keep_logs > 0 and sys.stdout is not original_stdout:
+            try:
+                sys.stdout.logfile.close()
+                sys.stdout = original_stdout
+            except Exception as e:
+                print(f"{YELLOW}Error closing log file: {e}{RESET}")
 	
 if __name__ == "__main__":
     main()
