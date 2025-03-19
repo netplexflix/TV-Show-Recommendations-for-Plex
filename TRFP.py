@@ -17,7 +17,11 @@ from datetime import datetime, timedelta
 import math
 import copy
 
+<<<<<<< Updated upstream
 __version__ = "2.1"
+=======
+__version__ = "2.2"
+>>>>>>> Stashed changes
 REPO_URL = "https://github.com/netplexflix/TV-Show-Recommendations-for-Plex"
 API_VERSION_URL = f"https://api.github.com/repos/netplexflix/TV-Show-Recommendations-for-Plex/releases/latest"
 
@@ -1448,6 +1452,8 @@ class PlexTVRecommender:
                     if token_response.status_code == 200:
                         token_data = token_response.json()
                         self.config['trakt']['access_token'] = token_data['access_token']
+                        self.config['trakt']['refresh_token'] = token_data['refresh_token']
+                        self.config['trakt']['token_expiration'] = int(time.time() + token_data['expires_in'])
                         self.trakt_headers['Authorization'] = f"Bearer {token_data['access_token']}"
                         
                         with open(os.path.join(os.path.dirname(__file__), 'config.yml'), 'w') as f:
@@ -1463,9 +1469,83 @@ class PlexTVRecommender:
                 print(f"{RED}Error getting device code: {response.status_code}{RESET}")
         except Exception as e:
             print(f"{RED}Error during Trakt authentication: {e}{RESET}")
+    
+    def _refresh_trakt_token(self):
+        """Refresh the Trakt access token using the refresh token"""
+        try:
+            if 'refresh_token' not in self.config['trakt']:
+                print(f"{YELLOW}No refresh token available. Re-authenticating...{RESET}")
+                self._authenticate_trakt()
+                return self._verify_trakt_token()
+                
+            refresh_response = requests.post(
+                'https://api.trakt.tv/oauth/token',
+                headers={'Content-Type': 'application/json'},
+                json={
+                    'refresh_token': self.config['trakt']['refresh_token'],
+                    'client_id': self.config['trakt']['client_id'],
+                    'client_secret': self.config['trakt']['client_secret'],
+                    'redirect_uri': 'urn:ietf:wg:oauth:2.0:oob',
+                    'grant_type': 'refresh_token'
+                }
+            )
+            
+            if refresh_response.status_code == 200:
+                token_data = refresh_response.json()
+                self.config['trakt']['access_token'] = token_data['access_token']
+                self.config['trakt']['refresh_token'] = token_data['refresh_token']
+                self.config['trakt']['token_expiration'] = int(time.time() + token_data['expires_in'])
+                self.trakt_headers['Authorization'] = f"Bearer {token_data['access_token']}"
+                
+                with open(os.path.join(os.path.dirname(__file__), 'config.yml'), 'w') as f:
+                    yaml.dump(self.config, f)
+                    
+                print(f"{GREEN}Successfully refreshed Trakt token{RESET}")
+                return True
+            else:
+                print(f"{YELLOW}Failed to refresh token: {refresh_response.status_code}. Re-authenticating...{RESET}")
+                self._authenticate_trakt()
+                return self._verify_trakt_token()
+                
+        except Exception as e:
+            print(f"{RED}Error refreshing Trakt token: {e}. Re-authenticating...{RESET}")
+            self._authenticate_trakt()
+            return self._verify_trakt_token()
+    
+    def _verify_trakt_token(self):
+        """Verify if the Trakt token is valid and refresh if needed"""
+        try:
+            # Check if token is expired based on stored expiration time
+            if ('token_expiration' in self.config['trakt'] and
+                time.time() > self.config['trakt']['token_expiration']):
+                print(f"{YELLOW}Trakt token expired. Refreshing...{RESET}")
+                return self._refresh_trakt_token()
+                
+            # Verify token with API call
+            test_response = requests.get(
+                "https://api.trakt.tv/sync/last_activities",
+                headers=self.trakt_headers
+            )
+            
+            if test_response.status_code == 401:
+                print(f"{YELLOW}Trakt token invalid. Refreshing...{RESET}")
+                return self._refresh_trakt_token()
+            elif test_response.status_code == 200:
+                return True
+            else:
+                print(f"{RED}Error verifying Trakt token: {test_response.status_code}{RESET}")
+                return False
+        except Exception as e:
+            print(f"{RED}Error connecting to Trakt: {e}{RESET}")
+            return False
 
     def _clear_trakt_watch_history(self):
         print(f"\n{YELLOW}Clearing Trakt watch history...{RESET}")
+        
+        # Verify token is valid before proceeding
+        if not self._verify_trakt_token():
+            print(f"{RED}Failed to verify Trakt token. Skipping clear operation.{RESET}")
+            return
         trakt_ids = []
         page = 1
         per_page = 100  # Max allowed by Trakt API
@@ -1533,8 +1613,13 @@ class PlexTVRecommender:
     def _sync_watched_shows_to_trakt(self):
         if not self.sync_watch_history:
             return
-    
+        
         print(f"\n{YELLOW}Starting Trakt watch history sync...{RESET}")
+        
+        # Verify token is valid before proceeding
+        if not self._verify_trakt_token():
+            print(f"{RED}Failed to verify Trakt token. Skipping sync operation.{RESET}")
+            return
         
         # Load existing synced episode IDs from cache
         previously_synced_ids = set()
@@ -1976,6 +2061,10 @@ class PlexTVRecommender:
     def get_trakt_recommendations(self) -> List[Dict]:
         print(f"\n{YELLOW}Checking Trakt recommendations...{RESET}")
         try:
+            # Verify token is valid before proceeding
+            if not self._verify_trakt_token():
+                print(f"{RED}Failed to verify Trakt token. Skipping recommendations.{RESET}")
+                return []
             # First check if there's any watch history
             history_response = requests.get(
                 "https://api.trakt.tv/sync/history/shows",
