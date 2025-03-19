@@ -17,11 +17,7 @@ from datetime import datetime, timedelta
 import math
 import copy
 
-<<<<<<< Updated upstream
-__version__ = "2.1"
-=======
 __version__ = "2.2"
->>>>>>> Stashed changes
 REPO_URL = "https://github.com/netplexflix/TV-Show-Recommendations-for-Plex"
 API_VERSION_URL = f"https://api.github.com/repos/netplexflix/TV-Show-Recommendations-for-Plex/releases/latest"
 
